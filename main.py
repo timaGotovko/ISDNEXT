@@ -17,6 +17,9 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.enums import ParseMode
 from aiogram.utils.markdown import hcode, hbold
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -519,7 +522,10 @@ def build_hotel_reports(pms_to_name: dict[int, str], base_dir: Path = SAVE_DIR):
 # ---------------------------------------------------------------------------
 # TELEGRAM BOT
 # ---------------------------------------------------------------------------
-bot = Bot(BOT_TOKEN, parse_mode=ParseMode.HTML)
+bot = Bot(
+    BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
 dp = Dispatcher()
 
 @dp.message(Command("start"))
