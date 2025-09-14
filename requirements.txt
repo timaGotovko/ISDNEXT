@@ -1,0 +1,5 @@
+aiogram==3.13.1
+python-dotenv==1.0.1
+pandas==2.2.2
+openpyxl==3.1.5
+playwright==1.45.0
