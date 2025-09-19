@@ -436,34 +436,68 @@ async def open_menu_and_go(page, item_text: str):
         raise RuntimeError("Переход не подтвердился (нет заголовка).")
 
 async def open_property_dropdown(page):
-    opener = None
-    for sel in [
+    """
+    Надёжно открывает мультиселект 'Select Property' и возвращает локатор панели списка.
+    Делает несколько попыток клика и ждёт появления панели дольше.
+    """
+    # список возможных "кнопок"-открывалок
+    opener_selectors = [
         "xpath=//ngc-multiselect-dropdown//div[contains(@class,'dropdown-btn')][.//span[contains(normalize-space(),'Select Property')]]",
         "xpath=//*[contains(@class,'multiselect-dropdown')]//div[contains(@class,'dropdown-btn')][.//span[contains(normalize-space(),'Select Property')]]",
+        "css=ngc-multiselect-dropdown .dropdown-btn",
+        "css=.multiselect-dropdown .dropdown-btn",
         "text=Select Property"
-    ]:
-        loc = page.locator(sel).first
+    ]
+
+    # пытаемся найти видимый opener
+    opener = None
+    for sel in opener_selectors:
         try:
-            await loc.wait_for(state="visible", timeout=4000)
+            loc = page.locator(sel).first
+            await loc.wait_for(state="visible", timeout=2500)
             opener = loc
             break
         except Exception:
             continue
     if not opener:
-        for sel in ["css=ngc-multiselect-dropdown .dropdown-btn", "css=.multiselect-dropdown .dropdown-btn"]:
-            loc = page.locator(sel).first
-            try:
-                await loc.wait_for(state="visible", timeout=1500)
-                opener = loc
-                break
-            except Exception:
-                continue
-    if not opener:
         raise RuntimeError("Не нашёл 'Select Property'.")
-    await opener.click()
-    panel = page.locator("css=.dropdown-list:not([hidden])").last
-    await panel.wait_for(state="visible", timeout=3000)
-    return panel
+
+    # делаем несколько попыток открыть дропдаун
+    last_err = None
+    for attempt in range(4):
+        try:
+            await opener.scroll_into_view_if_needed()
+            await opener.click(timeout=1500)
+            # ждём появление панели (увеличили таймаут)
+            panel = page.locator("css=.dropdown-list:not([hidden])").last
+            await panel.wait_for(state="visible", timeout=6000)
+            # иногда внутри есть ul, возвращаем «основу»
+            try:
+                panel_ul = panel.locator("ul").first
+                if await panel_ul.count() > 0:
+                    return panel
+            except Exception:
+                pass
+            return panel
+        except Exception as e:
+            last_err = e
+            # Закрыть все оверлеи/перевыбрать
+            try:
+                await page.keyboard.press("Escape")
+            except Exception:
+                pass
+            await asyncio.sleep(0.4)
+
+    # fallback: попробуем альтернативный контейнер в DOM (на некоторых версиях темы)
+    try:
+        panel = page.locator("css=.multiselect-dropdown .dropdown-list").last
+        await panel.wait_for(state="visible", timeout=2000)
+        return panel
+    except Exception:
+        pass
+
+    raise RuntimeError(f"Не удалось открыть список 'Select Property' (после нескольких попыток): {last_err}")
+
 
 async def list_hotels_from_dropdown(page) -> List[str]:
     panel = await open_property_dropdown(page)
