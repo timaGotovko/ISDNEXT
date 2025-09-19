@@ -29,40 +29,33 @@ API_BASE  = "https://idsdatahubdashboardapi.azurewebsites.net"
 URL       = "https://datahubdashboard.idsnext.live"
 MENU_ITEM = "Bookings from Channels to (FN & FX)"
 
-# Скорости/ограничения
-CONCURRENCY       = 32            # загрузка XML
+# СКОРОСТЬ/ОГРАНИЧЕНИЯ
+CONCURRENCY       = 32
 REQ_TIMEOUT_MS    = 60_000
 RETRY_ATTEMPTS    = 3
 RETRY_BASE_DELAY  = 0.5
 RETRY_JITTER      = 0.3
 
-BOOKLOG_CONCURRENCY    = 5        # параллелизм для IsBookinglog
-BOOKLOG_TIMEOUT_MS     = 25_000   # меньше, чтобы "мертвые" каналы не стопорили
-BOOKLOG_RETRY_ATTEMPTS = 3
-BOOKLOG_JITTER         = 0.4
-BOOKLOG_BASE_DELAY     = 0.6
+BOOKLOG_CONCURRENCY    = 4
+BOOKLOG_TIMEOUT_MS     = 120_000
+BOOKLOG_RETRY_ATTEMPTS = 5
+BOOKLOG_JITTER         = 0.6
+BOOKLOG_BASE_DELAY     = 0.8
 
 WRITERS = 8
 WRITE_QUEUE_MAXSIZE = 5000
+BATCH_SIZE  = 100_000
+BATCH_PAUSE = 0.0
 
+DEFAULT_CM_CODE = "CM1000"
+CM_CANDIDATES = ["CM1000", "CM7000", "CM4000", "CM1123", "CM9902"]
 WORK_ROOT = Path("work_runs")
 WORK_ROOT.mkdir(exist_ok=True)
 OLD_XML_DIR = Path("xml_api")  # из старых запусков — будем чистить
 
 SAFE_CHARS = re.compile(r'[\\/*?:"<>|]+')
+TEST_ONLY_PMS = 23
 
-# --- набор каналов, по которым ходим (можете расширять)
-CM_CANDIDATES = [
-    "CM1000",   # STAAH
-    "CM7000",   # RESAVENUE
-    "CM4000",   # MAXIMOJO
-    "CM1123",   # HOBSE
-    "CM9902",   # SABRE
-    "CM3000",   # TRAVELGURU (пример; если нет — просто вернёт пусто)
-]
-
-# Тестовый режим: один PMS
-TEST_ONLY_PMS = None   # например 7, чтобы тестировать только один отель
 
 
 # ---------------- FSM ----------------
@@ -100,6 +93,10 @@ def safe_rmtree(path: Path):
 
 # ========= ПАРСИНГ XML =========
 def parse_booking_info(xml_text: str) -> dict:
+    """
+    Парсим Arrival(Start) / Departure(End) / GivenName / Surname / Phone / Email / TotalAmount / Currency из XML.
+    Если чего-то нет — пустая строка.
+    """
     if not xml_text:
         return {}
     try:
@@ -133,6 +130,7 @@ def parse_booking_info(xml_text: str) -> dict:
     if ph_el is not None:
         phone = (ph_el.attrib.get("PhoneNumber", "") or "").strip()
 
+    # ---- Total ----
     total_amount = ""
     currency = ""
     total_el = root.find(".//ota:Total", ns)
@@ -156,6 +154,12 @@ def parse_booking_info(xml_text: str) -> dict:
     }
 
 def is_booking_com_xml(xml_text: str) -> bool:
+    """
+    Возвращает True, если XML относится к Booking.com.
+    Критерии:
+      - Source/BookingChannel/CompanyName[@Code='19'], либо
+      - текст CompanyName содержит 'booking.com'.
+    """
     if not xml_text:
         return False
 
@@ -177,10 +181,12 @@ def is_booking_com_xml(xml_text: str) -> bool:
     if comp is None:
         return False
 
+    # По коду
     code = (comp.attrib.get("Code") or "").strip()
     if code == "19":
         return True
 
+    # По тексту
     text = (comp.text or "").strip().lower()
     if "booking.com" in text:
         return True
@@ -188,8 +194,13 @@ def is_booking_com_xml(xml_text: str) -> bool:
     return False
 
 
+
 # ---------- TXT отчёты ----------
 def write_hotel_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
+    """
+    TXT-файл с разделителем '|'
+    Формат строки: HotelName|Arrival|Departure|GivenName|Phone|TotalAmount Currency
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     fn = safe_filename(hotel_name) + ".txt"
     path = out_dir / fn
@@ -210,6 +221,10 @@ def write_hotel_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
 
 
 def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List[Path], int, int]:
+    """
+    Перебираем все XML сохранённые по PMS, делаем TXT для каждого отеля.
+    Возвращаем: (список путей к TXT, total_rows, total_emails)
+    """
     out_paths = []
     save_dir = run_dir / "xml"
     report_dir = run_dir / "reports"
@@ -227,19 +242,24 @@ def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[Lis
             try:
                 xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
 
+                # ← фильтруем только Booking.com
                 if not is_booking_com_xml(xml_text):
                     continue
 
                 row = parse_booking_info(xml_text)
+
+                # пустые записи не учитываем
                 if any((row.get("start"), row.get("end"), row.get("given"), row.get("surname"),
                         row.get("phone"), row.get("email"), row.get("total"))):
                     rows.append(row)
             except Exception:
                 pass
 
+
         if rows:
             total_rows += len(rows)
             total_emails += sum(1 for r in rows if (r.get("email") or "").strip())
+
             out = write_hotel_txt(hotel_name, rows, report_dir)
             out_paths.append(out)
 
@@ -292,7 +312,7 @@ async def do_login(page, username: str, password: str):
             break
         except Exception:
             continue
-    if not pass_inп:
+    if not pass_inp:
         raise RuntimeError("Не нашёл поле Password")
 
     async def robust_fill_input(inp_loc, value):
@@ -309,8 +329,8 @@ async def do_login(page, username: str, password: str):
                 await inp_loc.element_handle(), value
             )
 
-    await robust_fill_input(email_inп, username)
-    await robust_fill_input(pass_inп, password)
+    await robust_fill_input(email_inp, username)
+    await robust_fill_input(pass_inp, password)
 
     clicked = False
     for sel in [
@@ -325,7 +345,7 @@ async def do_login(page, username: str, password: str):
         except Exception:
             continue
     if not clicked:
-        await pass_inп.press("Enter")
+        await pass_inp.press("Enter")
 
     try:
         await page.wait_for_selector(
@@ -568,11 +588,13 @@ async def writer_worker(queue: asyncio.Queue):
         finally:
             queue.task_done()
 
-async def _fetch_single_xml_ctx(req, pms: int, token: int, sem_xml: asyncio.Semaphore, write_queue: asyncio.Queue, run_dir: Path) -> bool:
+async def _fetch_single_xml_ctx(
+    req, pms: int, token: int, cm_code: str,
+    sem_xml: asyncio.Semaphore, write_queue: asyncio.Queue, run_dir: Path
+) -> bool:
     async with sem_xml:
         try:
-            # cmcode не нужен для получения самого XML — он вкладывается в токен
-            xml = await api_get_xml_ctx(req, pms, token, "CM1000")  # поле cmcode игнорируется беком; оставим любой
+            xml = await api_get_xml_ctx(req, pms, token, cm_code, "ReceivedXML")
             if not xml:
                 return False
             pms_dir = run_dir / "xml" / str(pms)
@@ -581,35 +603,33 @@ async def _fetch_single_xml_ctx(req, pms: int, token: int, sem_xml: asyncio.Sema
         except Exception:
             return False
 
-# --- получаем ВСЕ токены для одного PMS по нескольким каналам
-async def fetch_tokens_for_pms_all_cm(
-    req, pms: int, sem_booklog: asyncio.Semaphore,
-    date_from: str, date_to: str, cm_codes: list[str]
-) -> set[int]:
-    tokens: set[int] = set()
 
-    async def _load_one(cm: str) -> None:
-        try:
-            async with sem_booklog:
-                booking_log = await api_is_bookinglog_ctx(req, pms, date_from, date_to, cm)
-            for row in booking_log or []:
-                tr = row.get("echoToken")
-                try:
-                    t = int(float(tr))
-                    if t:
-                        tokens.add(t)
-                except Exception:
-                    continue
-        except Exception:
-            # канал не дал ответ — просто пропускаем
-            pass
+async def fetch_xml_for_pms_ctx(req, pms, sem_xml, write_queue,
+                                sem_booklog, date_from, date_to, cm_code, run_dir) -> int:
+    try:
+        async with sem_booklog:
+            booking_log = await api_is_bookinglog_ctx(req, pms, date_from, date_to, cm_code)
+        if not booking_log:
+            return 0
 
-    tasks = [asyncio.create_task(_load_one(cm)) for cm in cm_codes]
-    # ждём завершения всех каналов, но не блокируемся на одном
-    await asyncio.gather(*tasks, return_exceptions=True)
-    return tokens
+        tasks = []
+        for row in booking_log:
+            token_raw = row.get("echoToken")
+            try:
+                token = int(float(token_raw))
+            except Exception:
+                token = 0
+            if token:
+                tasks.append(_fetch_single_xml_ctx(req, pms, token, cm_code, sem_xml, write_queue, run_dir))
+        if not tasks:
+            return 0
 
-# --- одна PMS целиком: собираем токены по всем каналам, затем тянем XML
+        result = await asyncio.gather(*tasks, return_exceptions=True)
+        saved = sum(1 for r in result if isinstance(r, bool) and r)
+        return saved
+    except Exception:
+        return 0
+
 async def fetch_xml_for_pms_multi_cm(
     req,
     pms: int,
@@ -622,16 +642,32 @@ async def fetch_xml_for_pms_multi_cm(
     run_dir: Path
 ) -> int:
     try:
-        all_tokens = await fetch_tokens_for_pms_all_cm(
-            req, pms, sem_booklog, date_from, date_to, cm_codes
-        )
-        if not all_tokens:
+        # token -> cm_code
+        token_to_cm: dict[int, str] = {}
+        for cm in cm_codes:
+            async with sem_booklog:
+                booking_log = await api_is_bookinglog_ctx(req, pms, date_from, date_to, cm)
+            if not booking_log:
+                continue
+            for row in booking_log:
+                token_raw = row.get("echoToken")
+                try:
+                    token = int(float(token_raw))
+                    if token and token not in token_to_cm:
+                        token_to_cm[token] = cm
+                except Exception:
+                    continue
+
+        if not token_to_cm:
             return 0
 
-        tasks = [ _fetch_single_xml_ctx(req, pms, t, sem_xml, write_queue, run_dir)
-                  for t in all_tokens ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        return sum(1 for r in results if isinstance(r, bool) and r)
+        tasks = [
+            _fetch_single_xml_ctx(req, pms, token, cm, sem_xml, write_queue, run_dir)
+            for token, cm in token_to_cm.items()
+        ]
+        result = await asyncio.gather(*tasks, return_exceptions=True)
+        saved = sum(1 for r in result if isinstance(r, bool) and r)
+        return saved
     except Exception:
         return 0
 
@@ -695,16 +731,17 @@ async def get_dates_and_start(m: Message, state: FSMContext):
     username = data["username"]
     password = data["password"]
 
+    # Очистка старых директорий
     safe_rmtree(OLD_XML_DIR)
     run_dir = WORK_ROOT / f"run_{m.chat.id}_{m.message_id}"
     safe_rmtree(run_dir)
     run_dir.mkdir(exist_ok=True, parents=True)
 
-    asyncio.create_task(run_job_and_reply(m, username, password, date_from, date_to, run_dir))
+    asyncio.create_task(run_job_and_reply(m, username, password, date_from, date_to, DEFAULT_CM_CODE, run_dir))
     await m.answer("Запустил парсинг. Это займёт некоторое время. Буду присылать прогресс.")
     await state.clear()
 
-async def run_job_and_reply(m: Message, username: str, password: str, date_from: str, date_to: str, run_dir: Path):
+async def run_job_and_reply(m: Message, username: str, password: str, date_from: str, date_to: str, cm_code: str, run_dir: Path):
     try:
         # 1) Получаем PMS->Name
         try:
@@ -716,7 +753,6 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 await do_login(page, username, password)
                 await open_menu_and_go(page, MENU_ITEM)
 
-                # Немного чистим ресурсы
                 async def route_handler(route, request):
                     rtype = request.resource_type
                     url = request.url
@@ -743,8 +779,6 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 pms_to_name[p] = name
         all_pms = sorted(set(all_pms))
         await m.answer(f"Найдено {len(all_pms)} отелей (PMS). Начинаю загрузку XML...")
-
-        # Тестовый PMS
         if TEST_ONLY_PMS is not None:
             if TEST_ONLY_PMS in pms_to_name:
                 all_pms = [TEST_ONLY_PMS]
@@ -754,7 +788,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 await m.answer(f"Тестовый режим: PMS={TEST_ONLY_PMS} не найден среди доступных ({len(pms_to_name)} шт.). Останавливаю.")
                 return
 
-        # 2) Получаем XML и пишем (по всем каналам из CM_CANDIDATES)
+        # 2) Получаем XML и пишем
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
@@ -767,30 +801,21 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 writer_tasks = [asyncio.create_task(writer_worker(write_queue)) for _ in range(WRITERS)]
 
                 total_saved = 0
-                finished = 0
-                REPORT_EVERY = 10  # каждые 10 PMS обновляем прогресс
-
+                cm_codes = CM_CANDIDATES 
                 tasks = [
-                    asyncio.create_task(
-                        fetch_xml_for_pms_multi_cm(
-                            req, pms, sem_xml, write_queue, sem_booklog,
-                            date_from, date_to, CM_CANDIDATES, run_dir
-                        )
+                    fetch_xml_for_pms_multi_cm(
+                        req, pms, sem_xml, write_queue, sem_booklog,
+                        date_from, date_to, cm_codes, run_dir
                     )
                     for pms in all_pms
                 ]
 
-                for fut in asyncio.as_completed(tasks):
-                    try:
-                        saved = await fut
-                        if isinstance(saved, int):
-                            total_saved += saved
-                    except Exception:
-                        pass
-                    finally:
-                        finished += 1
-                        if finished % REPORT_EVERY == 0 or finished == len(tasks):
-                            await m.answer(f"Прогресс: обработано PMS {finished}/{len(tasks)}, XML сохранено: {total_saved}")
+                step = 50
+                for i in range(0, len(tasks), step):
+                    chunk = tasks[i:i+step]
+                    res = await asyncio.gather(*chunk)
+                    total_saved += sum(res)
+                    await m.answer(f"Прогресс: обработано PMS {min(i+step,len(tasks))}/{len(tasks)}, XML сохранено: {total_saved}")
 
                 # Завершаем писателей
                 for _ in range(WRITERS):
@@ -817,7 +842,8 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
 
         await m.answer(f"Сформировано отчётов: {len(reports)}.\n"
                        f"Всего номеров: {total_rows}\n"
-                       f"Всего email'ов: {total_emails}\n"
+                    #    f"Всего email'ов: {total_emails}\n"
+                    #    f"Всего email'ов: {total_emails}\n"
                        f"Упаковываю в ZIP...")
 
         # 4) Архив (ZIP) и отправка
@@ -825,7 +851,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
             archive_path = run_dir / "reports"
             final_archive = create_zip(reports, archive_path)
             await m.answer_document(FSInputFile(final_archive),
-                                    caption=f"Готово! TXT: {len(reports)} | Номеров: {total_rows} | Email: {total_emails}")
+                                    caption=f"Готово! TXT: {len(reports)} | Номеров: {total_rows}")
         except Exception as e:
             await send_error(m, "Архивирование/отправка", e)
             return
