@@ -1,4 +1,5 @@
 import os
+import io
 import re
 import json
 import random
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
 import pandas as pd
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile
 from aiogram.filters import CommandStart
 from aiogram.fsm.state import StatesGroup, State
@@ -28,31 +29,40 @@ API_BASE  = "https://idsdatahubdashboardapi.azurewebsites.net"
 URL       = "https://datahubdashboard.idsnext.live"
 MENU_ITEM = "Bookings from Channels to (FN & FX)"
 
-# СКОРОСТЬ/ОГРАНИЧЕНИЯ
-CONCURRENCY       = 32
+# Скорости/ограничения
+CONCURRENCY       = 32            # загрузка XML
 REQ_TIMEOUT_MS    = 60_000
 RETRY_ATTEMPTS    = 3
 RETRY_BASE_DELAY  = 0.5
 RETRY_JITTER      = 0.3
 
-BOOKLOG_CONCURRENCY    = 4
-BOOKLOG_TIMEOUT_MS     = 120_000
-BOOKLOG_RETRY_ATTEMPTS = 5
-BOOKLOG_JITTER         = 0.6
-BOOKLOG_BASE_DELAY     = 0.8
+BOOKLOG_CONCURRENCY    = 5        # параллелизм для IsBookinglog
+BOOKLOG_TIMEOUT_MS     = 25_000   # меньше, чтобы "мертвые" каналы не стопорили
+BOOKLOG_RETRY_ATTEMPTS = 3
+BOOKLOG_JITTER         = 0.4
+BOOKLOG_BASE_DELAY     = 0.6
 
 WRITERS = 8
 WRITE_QUEUE_MAXSIZE = 5000
-BATCH_SIZE  = 100_000
-BATCH_PAUSE = 0.0
 
-DEFAULT_CM_CODE = "CM1000"
 WORK_ROOT = Path("work_runs")
 WORK_ROOT.mkdir(exist_ok=True)
 OLD_XML_DIR = Path("xml_api")  # из старых запусков — будем чистить
 
 SAFE_CHARS = re.compile(r'[\\/*?:"<>|]+')
-TEST_ONLY_PMS = None  # для теста поменяйте на 7 или None
+
+# --- набор каналов, по которым ходим (можете расширять)
+CM_CANDIDATES = [
+    "CM1000",   # STAAH
+    "CM7000",   # RESAVENUE
+    "CM4000",   # MAXIMOJO
+    "CM1123",   # HOBSE
+    "CM9902",   # SABRE
+    "CM3000",   # TRAVELGURU (пример; если нет — просто вернёт пусто)
+]
+
+# Тестовый режим: один PMS
+TEST_ONLY_PMS = None   # например 7, чтобы тестировать только один отель
 
 
 # ---------------- FSM ----------------
@@ -90,10 +100,6 @@ def safe_rmtree(path: Path):
 
 # ========= ПАРСИНГ XML =========
 def parse_booking_info(xml_text: str) -> dict:
-    """
-    Парсим Arrival(Start) / Departure(End) / GivenName / Surname / Phone / Email / TotalAmount / Currency из XML.
-    Если чего-то нет — пустая строка.
-    """
     if not xml_text:
         return {}
     try:
@@ -127,7 +133,6 @@ def parse_booking_info(xml_text: str) -> dict:
     if ph_el is not None:
         phone = (ph_el.attrib.get("PhoneNumber", "") or "").strip()
 
-    # ---- Total ----
     total_amount = ""
     currency = ""
     total_el = root.find(".//ota:Total", ns)
@@ -151,12 +156,6 @@ def parse_booking_info(xml_text: str) -> dict:
     }
 
 def is_booking_com_xml(xml_text: str) -> bool:
-    """
-    Возвращает True, если XML относится к Booking.com.
-    Критерии:
-      - Source/BookingChannel/CompanyName[@Code='19'], либо
-      - текст CompanyName содержит 'booking.com'.
-    """
     if not xml_text:
         return False
 
@@ -191,10 +190,6 @@ def is_booking_com_xml(xml_text: str) -> bool:
 
 # ---------- TXT отчёты ----------
 def write_hotel_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
-    """
-    TXT-файл с разделителем '|'
-    Формат строки: HotelName|Arrival|Departure|GivenName Surname|Phone|TotalAmount Currency
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
     fn = safe_filename(hotel_name) + ".txt"
     path = out_dir / fn
@@ -215,10 +210,6 @@ def write_hotel_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
 
 
 def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List[Path], int, int]:
-    """
-    Перебираем все XML сохранённые по PMS, делаем TXT для каждого отеля.
-    Возвращаем: (список путей к TXT, total_rows, total_emails)
-    """
     out_paths = []
     save_dir = run_dir / "xml"
     report_dir = run_dir / "reports"
@@ -236,13 +227,10 @@ def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[Lis
             try:
                 xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
 
-                # ← фильтруем только Booking.com
                 if not is_booking_com_xml(xml_text):
                     continue
 
                 row = parse_booking_info(xml_text)
-
-                # пустые записи не учитываем
                 if any((row.get("start"), row.get("end"), row.get("given"), row.get("surname"),
                         row.get("phone"), row.get("email"), row.get("total"))):
                     rows.append(row)
@@ -252,7 +240,6 @@ def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[Lis
         if rows:
             total_rows += len(rows)
             total_emails += sum(1 for r in rows if (r.get("email") or "").strip())
-
             out = write_hotel_txt(hotel_name, rows, report_dir)
             out_paths.append(out)
 
@@ -305,7 +292,7 @@ async def do_login(page, username: str, password: str):
             break
         except Exception:
             continue
-    if not pass_inp:
+    if not pass_inп:
         raise RuntimeError("Не нашёл поле Password")
 
     async def robust_fill_input(inp_loc, value):
@@ -322,8 +309,8 @@ async def do_login(page, username: str, password: str):
                 await inp_loc.element_handle(), value
             )
 
-    await robust_fill_input(email_inp, username)
-    await robust_fill_input(pass_inp, password)
+    await robust_fill_input(email_inп, username)
+    await robust_fill_input(pass_inп, password)
 
     clicked = False
     for sel in [
@@ -338,7 +325,7 @@ async def do_login(page, username: str, password: str):
         except Exception:
             continue
     if not clicked:
-        await pass_inp.press("Enter")
+        await pass_inп.press("Enter")
 
     try:
         await page.wait_for_selector(
@@ -436,68 +423,34 @@ async def open_menu_and_go(page, item_text: str):
         raise RuntimeError("Переход не подтвердился (нет заголовка).")
 
 async def open_property_dropdown(page):
-    """
-    Надёжно открывает мультиселект 'Select Property' и возвращает локатор панели списка.
-    Делает несколько попыток клика и ждёт появления панели дольше.
-    """
-    # список возможных "кнопок"-открывалок
-    opener_selectors = [
+    opener = None
+    for sel in [
         "xpath=//ngc-multiselect-dropdown//div[contains(@class,'dropdown-btn')][.//span[contains(normalize-space(),'Select Property')]]",
         "xpath=//*[contains(@class,'multiselect-dropdown')]//div[contains(@class,'dropdown-btn')][.//span[contains(normalize-space(),'Select Property')]]",
-        "css=ngc-multiselect-dropdown .dropdown-btn",
-        "css=.multiselect-dropdown .dropdown-btn",
         "text=Select Property"
-    ]
-
-    # пытаемся найти видимый opener
-    opener = None
-    for sel in opener_selectors:
+    ]:
+        loc = page.locator(sel).first
         try:
-            loc = page.locator(sel).first
-            await loc.wait_for(state="visible", timeout=2500)
+            await loc.wait_for(state="visible", timeout=4000)
             opener = loc
             break
         except Exception:
             continue
     if not opener:
+        for sel in ["css=ngc-multiselect-dropdown .dropdown-btn", "css=.multiselect-dropdown .dropdown-btn"]:
+            loc = page.locator(sel).first
+            try:
+                await loc.wait_for(state="visible", timeout=1500)
+                opener = loc
+                break
+            except Exception:
+                continue
+    if not opener:
         raise RuntimeError("Не нашёл 'Select Property'.")
-
-    # делаем несколько попыток открыть дропдаун
-    last_err = None
-    for attempt in range(4):
-        try:
-            await opener.scroll_into_view_if_needed()
-            await opener.click(timeout=1500)
-            # ждём появление панели (увеличили таймаут)
-            panel = page.locator("css=.dropdown-list:not([hidden])").last
-            await panel.wait_for(state="visible", timeout=6000)
-            # иногда внутри есть ul, возвращаем «основу»
-            try:
-                panel_ul = panel.locator("ul").first
-                if await panel_ul.count() > 0:
-                    return panel
-            except Exception:
-                pass
-            return panel
-        except Exception as e:
-            last_err = e
-            # Закрыть все оверлеи/перевыбрать
-            try:
-                await page.keyboard.press("Escape")
-            except Exception:
-                pass
-            await asyncio.sleep(0.4)
-
-    # fallback: попробуем альтернативный контейнер в DOM (на некоторых версиях темы)
-    try:
-        panel = page.locator("css=.multiselect-dropdown .dropdown-list").last
-        await panel.wait_for(state="visible", timeout=2000)
-        return panel
-    except Exception:
-        pass
-
-    raise RuntimeError(f"Не удалось открыть список 'Select Property' (после нескольких попыток): {last_err}")
-
+    await opener.click()
+    panel = page.locator("css=.dropdown-list:not([hidden])").last
+    await panel.wait_for(state="visible", timeout=3000)
+    return panel
 
 async def list_hotels_from_dropdown(page) -> List[str]:
     panel = await open_property_dropdown(page)
@@ -511,72 +464,6 @@ async def list_hotels_from_dropdown(page) -> List[str]:
     except Exception:
         pass
     return texts
-
-# ------- новый блок: выбор PMS и чтение текущего канала -------
-CM_CODE_RE = re.compile(r"\bCM\d{3,6}\b")
-
-async def select_single_property_by_pms(page, pms: int) -> bool:
-    """
-    В мультиселекте 'Select Property' оставляет только один пункт (pms).
-    Возвращает True, если удалось.
-    """
-    panel = await open_property_dropdown(page)
-    # попытка снять все выбранные
-    try:
-        un = panel.get_by_text("Unselect All", exact=False)
-        if await un.is_visible():
-            await un.click(timeout=600)
-            await asyncio.sleep(0.15)
-    except Exception:
-        pass
-
-    # щёлкаем по нужному PMS
-    item = panel.locator(
-        f"xpath=.//li[starts-with(normalize-space(),'{pms} ') or starts-with(normalize-space(),'{pms}-')]"
-    ).first
-    try:
-        await item.scroll_into_view_if_needed()
-        await item.click(timeout=1000)
-    except Exception:
-        try:
-            await page.keyboard.press("Escape")
-        except Exception:
-            pass
-        return False
-
-    try:
-        await page.keyboard.press("Escape")
-    except Exception:
-        pass
-    return True
-
-async def get_selected_channel_code(page) -> Optional[str]:
-    """
-    Возвращает CM-код из текущего выбранного 'Select channel'.
-    """
-    try:
-        text = (await page.locator("css=mat-select .mat-select-value").inner_text()).strip()
-        m = CM_CODE_RE.search(text)
-        if m:
-            return m.group(0)
-    except Exception:
-        pass
-    return None
-
-async def build_pms_to_cm_map(page, pms_list: list[int]) -> dict[int, str]:
-    """
-    Для каждого PMS: выбираем его в мультиселекте, читаем автоматически выбранный канал.
-    """
-    out: dict[int, str] = {}
-    for p in pms_list:
-        ok = await select_single_property_by_pms(page, p)
-        if not ok:
-            continue
-        cm = await get_selected_channel_code(page)
-        if cm:
-            out[p] = cm
-        await asyncio.sleep(0.05)
-    return out
 
 
 # ---------------- API ----------------
@@ -684,7 +571,8 @@ async def writer_worker(queue: asyncio.Queue):
 async def _fetch_single_xml_ctx(req, pms: int, token: int, sem_xml: asyncio.Semaphore, write_queue: asyncio.Queue, run_dir: Path) -> bool:
     async with sem_xml:
         try:
-            xml = await api_get_xml_ctx(req, pms, token, DEFAULT_CM_CODE, "ReceivedXML")
+            # cmcode не нужен для получения самого XML — он вкладывается в токен
+            xml = await api_get_xml_ctx(req, pms, token, "CM1000")  # поле cmcode игнорируется беком; оставим любой
             if not xml:
                 return False
             pms_dir = run_dir / "xml" / str(pms)
@@ -693,30 +581,57 @@ async def _fetch_single_xml_ctx(req, pms: int, token: int, sem_xml: asyncio.Sema
         except Exception:
             return False
 
-async def fetch_xml_for_pms_ctx(req, pms: int, sem_xml: asyncio.Semaphore, write_queue: asyncio.Queue,
-                                sem_booklog: asyncio.Semaphore, date_from: str, date_to: str, cm_code: str, run_dir: Path) -> int:
+# --- получаем ВСЕ токены для одного PMS по нескольким каналам
+async def fetch_tokens_for_pms_all_cm(
+    req, pms: int, sem_booklog: asyncio.Semaphore,
+    date_from: str, date_to: str, cm_codes: list[str]
+) -> set[int]:
+    tokens: set[int] = set()
+
+    async def _load_one(cm: str) -> None:
+        try:
+            async with sem_booklog:
+                booking_log = await api_is_bookinglog_ctx(req, pms, date_from, date_to, cm)
+            for row in booking_log or []:
+                tr = row.get("echoToken")
+                try:
+                    t = int(float(tr))
+                    if t:
+                        tokens.add(t)
+                except Exception:
+                    continue
+        except Exception:
+            # канал не дал ответ — просто пропускаем
+            pass
+
+    tasks = [asyncio.create_task(_load_one(cm)) for cm in cm_codes]
+    # ждём завершения всех каналов, но не блокируемся на одном
+    await asyncio.gather(*tasks, return_exceptions=True)
+    return tokens
+
+# --- одна PMS целиком: собираем токены по всем каналам, затем тянем XML
+async def fetch_xml_for_pms_multi_cm(
+    req,
+    pms: int,
+    sem_xml: asyncio.Semaphore,
+    write_queue: asyncio.Queue,
+    sem_booklog: asyncio.Semaphore,
+    date_from: str,
+    date_to: str,
+    cm_codes: list[str],
+    run_dir: Path
+) -> int:
     try:
-        async with sem_booklog:
-            booking_log = await api_is_bookinglog_ctx(req, pms, date_from, date_to, cm_code)
-        if not booking_log:
+        all_tokens = await fetch_tokens_for_pms_all_cm(
+            req, pms, sem_booklog, date_from, date_to, cm_codes
+        )
+        if not all_tokens:
             return 0
 
-        tasks = []
-        for row in booking_log:
-            token_raw = row.get("echoToken")
-            try:
-                token = int(float(token_raw))
-            except Exception:
-                token = 0
-            if token:
-                tasks.append(_fetch_single_xml_ctx(req, pms, token, sem_xml, write_queue, run_dir))
-
-        if not tasks:
-            return 0
-
-        result = await asyncio.gather(*tasks, return_exceptions=True)
-        saved = sum(1 for r in result if isinstance(r, bool) and r)
-        return saved
+        tasks = [ _fetch_single_xml_ctx(req, pms, t, sem_xml, write_queue, run_dir)
+                  for t in all_tokens ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return sum(1 for r in results if isinstance(r, bool) and r)
     except Exception:
         return 0
 
@@ -780,19 +695,18 @@ async def get_dates_and_start(m: Message, state: FSMContext):
     username = data["username"]
     password = data["password"]
 
-    # Очистка старых директорий
     safe_rmtree(OLD_XML_DIR)
     run_dir = WORK_ROOT / f"run_{m.chat.id}_{m.message_id}"
     safe_rmtree(run_dir)
     run_dir.mkdir(exist_ok=True, parents=True)
 
-    asyncio.create_task(run_job_and_reply(m, username, password, date_from, date_to, DEFAULT_CM_CODE, run_dir))
+    asyncio.create_task(run_job_and_reply(m, username, password, date_from, date_to, run_dir))
     await m.answer("Запустил парсинг. Это займёт некоторое время. Буду присылать прогресс.")
     await state.clear()
 
-async def run_job_and_reply(m: Message, username: str, password: str, date_from: str, date_to: str, cm_code: str, run_dir: Path):
+async def run_job_and_reply(m: Message, username: str, password: str, date_from: str, date_to: str, run_dir: Path):
     try:
-        # 1) Получаем PMS->Name и карту PMS->выбранный CM
+        # 1) Получаем PMS->Name
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
@@ -802,6 +716,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 await do_login(page, username, password)
                 await open_menu_and_go(page, MENU_ITEM)
 
+                # Немного чистим ресурсы
                 async def route_handler(route, request):
                     rtype = request.resource_type
                     url = request.url
@@ -813,40 +728,33 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 await context.route("**/*", route_handler)
 
                 labels = await list_hotels_from_dropdown(page)
-
-                # строим список PMS/названий
-                all_pms: List[int] = []
-                pms_to_name: Dict[int, str] = {}
-                for txt in labels:
-                    p = extract_pms_from_label(txt)
-                    if p:
-                        all_pms.append(p)
-                        name = txt.split("-", 1)[-1].strip()
-                        pms_to_name[p] = name
-                all_pms = sorted(set(all_pms))
-
-                await m.answer(f"Найдено {len(all_pms)} отелей (PMS). Начинаю загрузку XML...")
-
-                # Тестовый режим по PMS
-                if TEST_ONLY_PMS is not None:
-                    if TEST_ONLY_PMS in pms_to_name:
-                        all_pms = [TEST_ONLY_PMS]
-                        pms_to_name = {TEST_ONLY_PMS: pms_to_name[TEST_ONLY_PMS]}
-                        await m.answer(f"Тестовый режим: работаем только с PMS={TEST_ONLY_PMS} ({pms_to_name[TEST_ONLY_PMS]})")
-                    else:
-                        await m.answer(f"Тестовый режим: PMS={TEST_ONLY_PMS} не найден среди доступных ({len(pms_to_name)} шт.). Останавливаю.")
-                        await browser.close()
-                        return
-
-                # строим карту PMS -> auto-selected CM
-                pms_to_cm = await build_pms_to_cm_map(page, all_pms)
-
                 await browser.close()
         except Exception as e:
-            await send_error(m, "Сбор списка PMS/каналов", e)
+            await send_error(m, "Сбор списка PMS/отелей", e)
             return
 
-        # 2) Получаем XML и пишем
+        all_pms: List[int] = []
+        pms_to_name: Dict[int, str] = {}
+        for txt in labels:
+            p = extract_pms_from_label(txt)
+            if p:
+                all_pms.append(p)
+                name = txt.split("-", 1)[-1].strip()
+                pms_to_name[p] = name
+        all_pms = sorted(set(all_pms))
+        await m.answer(f"Найдено {len(all_pms)} отелей (PMS). Начинаю загрузку XML...")
+
+        # Тестовый PMS
+        if TEST_ONLY_PMS is not None:
+            if TEST_ONLY_PMS in pms_to_name:
+                all_pms = [TEST_ONLY_PMS]
+                pms_to_name = {TEST_ONLY_PMS: pms_to_name[TEST_ONLY_PMS]}
+                await m.answer(f"Тестовый режим: работаем только с PMS={TEST_ONLY_PMS} ({pms_to_name[TEST_ONLY_PMS]})")
+            else:
+                await m.answer(f"Тестовый режим: PMS={TEST_ONLY_PMS} не найден среди доступных ({len(pms_to_name)} шт.). Останавливаю.")
+                return
+
+        # 2) Получаем XML и пишем (по всем каналам из CM_CANDIDATES)
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
@@ -859,20 +767,30 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 writer_tasks = [asyncio.create_task(writer_worker(write_queue)) for _ in range(WRITERS)]
 
                 total_saved = 0
+                finished = 0
+                REPORT_EVERY = 10  # каждые 10 PMS обновляем прогресс
+
                 tasks = [
-                    fetch_xml_for_pms_ctx(
-                        req, pms, sem_xml, write_queue, sem_booklog,
-                        date_from, date_to, pms_to_cm.get(pms, DEFAULT_CM_CODE), run_dir
+                    asyncio.create_task(
+                        fetch_xml_for_pms_multi_cm(
+                            req, pms, sem_xml, write_queue, sem_booklog,
+                            date_from, date_to, CM_CANDIDATES, run_dir
+                        )
                     )
-                    for pms in pms_to_cm.keys()  # работаем только с теми, кому удалось определить CM
+                    for pms in all_pms
                 ]
 
-                step = 50
-                for i in range(0, len(tasks), step):
-                    chunk = tasks[i:i+step]
-                    res = await asyncio.gather(*chunk)
-                    total_saved += sum(res)
-                    await m.answer(f"Прогресс: обработано PMS {min(i+step,len(tasks))}/{len(tasks)}, XML сохранено: {total_saved}")
+                for fut in asyncio.as_completed(tasks):
+                    try:
+                        saved = await fut
+                        if isinstance(saved, int):
+                            total_saved += saved
+                    except Exception:
+                        pass
+                    finally:
+                        finished += 1
+                        if finished % REPORT_EVERY == 0 or finished == len(tasks):
+                            await m.answer(f"Прогресс: обработано PMS {finished}/{len(tasks)}, XML сохранено: {total_saved}")
 
                 # Завершаем писателей
                 for _ in range(WRITERS):
@@ -899,6 +817,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
 
         await m.answer(f"Сформировано отчётов: {len(reports)}.\n"
                        f"Всего номеров: {total_rows}\n"
+                       f"Всего email'ов: {total_emails}\n"
                        f"Упаковываю в ZIP...")
 
         # 4) Архив (ZIP) и отправка
@@ -906,7 +825,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
             archive_path = run_dir / "reports"
             final_archive = create_zip(reports, archive_path)
             await m.answer_document(FSInputFile(final_archive),
-                                    caption=f"Готово! TXT: {len(reports)} | Номеров: {total_rows}")
+                                    caption=f"Готово! TXT: {len(reports)} | Номеров: {total_rows} | Email: {total_emails}")
         except Exception as e:
             await send_error(m, "Архивирование/отправка", e)
             return
