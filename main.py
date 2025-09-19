@@ -48,12 +48,12 @@ BATCH_SIZE  = 100_000
 BATCH_PAUSE = 0.0
 
 DEFAULT_CM_CODE = "CM1000"
-CM_CANDIDATES = ["CM1000", "CM7000", "CM4000", "CM1123", "CM9902"]
 WORK_ROOT = Path("work_runs")
 WORK_ROOT.mkdir(exist_ok=True)
 OLD_XML_DIR = Path("xml_api")  # из старых запусков — будем чистить
 
 SAFE_CHARS = re.compile(r'[\\/*?:"<>|]+')
+# TEST_ONLY_PMS = 7
 TEST_ONLY_PMS = None
 
 
@@ -588,13 +588,10 @@ async def writer_worker(queue: asyncio.Queue):
         finally:
             queue.task_done()
 
-async def _fetch_single_xml_ctx(
-    req, pms: int, token: int, cm_code: str,
-    sem_xml: asyncio.Semaphore, write_queue: asyncio.Queue, run_dir: Path
-) -> bool:
+async def _fetch_single_xml_ctx(req, pms: int, token: int, sem_xml: asyncio.Semaphore, write_queue: asyncio.Queue, run_dir: Path) -> bool:
     async with sem_xml:
         try:
-            xml = await api_get_xml_ctx(req, pms, token, cm_code, "ReceivedXML")
+            xml = await api_get_xml_ctx(req, pms, token, DEFAULT_CM_CODE, "ReceivedXML")
             if not xml:
                 return False
             pms_dir = run_dir / "xml" / str(pms)
@@ -603,9 +600,8 @@ async def _fetch_single_xml_ctx(
         except Exception:
             return False
 
-
-async def fetch_xml_for_pms_ctx(req, pms, sem_xml, write_queue,
-                                sem_booklog, date_from, date_to, cm_code, run_dir) -> int:
+async def fetch_xml_for_pms_ctx(req, pms: int, sem_xml: asyncio.Semaphore, write_queue: asyncio.Queue,
+                                sem_booklog: asyncio.Semaphore, date_from: str, date_to: str, cm_code: str, run_dir: Path) -> int:
     try:
         async with sem_booklog:
             booking_log = await api_is_bookinglog_ctx(req, pms, date_from, date_to, cm_code)
@@ -620,51 +616,11 @@ async def fetch_xml_for_pms_ctx(req, pms, sem_xml, write_queue,
             except Exception:
                 token = 0
             if token:
-                tasks.append(_fetch_single_xml_ctx(req, pms, token, cm_code, sem_xml, write_queue, run_dir))
+                tasks.append(_fetch_single_xml_ctx(req, pms, token, sem_xml, write_queue, run_dir))
+
         if not tasks:
             return 0
 
-        result = await asyncio.gather(*tasks, return_exceptions=True)
-        saved = sum(1 for r in result if isinstance(r, bool) and r)
-        return saved
-    except Exception:
-        return 0
-
-async def fetch_xml_for_pms_multi_cm(
-    req,
-    pms: int,
-    sem_xml: asyncio.Semaphore,
-    write_queue: asyncio.Queue,
-    sem_booklog: asyncio.Semaphore,
-    date_from: str,
-    date_to: str,
-    cm_codes: list[str],
-    run_dir: Path
-) -> int:
-    try:
-        # token -> cm_code
-        token_to_cm: dict[int, str] = {}
-        for cm in cm_codes:
-            async with sem_booklog:
-                booking_log = await api_is_bookinglog_ctx(req, pms, date_from, date_to, cm)
-            if not booking_log:
-                continue
-            for row in booking_log:
-                token_raw = row.get("echoToken")
-                try:
-                    token = int(float(token_raw))
-                    if token and token not in token_to_cm:
-                        token_to_cm[token] = cm
-                except Exception:
-                    continue
-
-        if not token_to_cm:
-            return 0
-
-        tasks = [
-            _fetch_single_xml_ctx(req, pms, token, cm, sem_xml, write_queue, run_dir)
-            for token, cm in token_to_cm.items()
-        ]
         result = await asyncio.gather(*tasks, return_exceptions=True)
         saved = sum(1 for r in result if isinstance(r, bool) and r)
         return saved
@@ -801,12 +757,8 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 writer_tasks = [asyncio.create_task(writer_worker(write_queue)) for _ in range(WRITERS)]
 
                 total_saved = 0
-                cm_codes = CM_CANDIDATES 
                 tasks = [
-                    fetch_xml_for_pms_multi_cm(
-                        req, pms, sem_xml, write_queue, sem_booklog,
-                        date_from, date_to, cm_codes, run_dir
-                    )
+                    fetch_xml_for_pms_ctx(req, pms, sem_xml, write_queue, sem_booklog, date_from, date_to, cm_code, run_dir)
                     for pms in all_pms
                 ]
 
@@ -851,6 +803,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
             archive_path = run_dir / "reports"
             final_archive = create_zip(reports, archive_path)
             await m.answer_document(FSInputFile(final_archive),
+                                    # caption=f"Готово! TXT: {len(reports)} | Номеров: {total_rows} | Email: {total_emails}")
                                     caption=f"Готово! TXT: {len(reports)} | Номеров: {total_rows}")
         except Exception as e:
             await send_error(m, "Архивирование/отправка", e)
