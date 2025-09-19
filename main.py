@@ -152,6 +152,47 @@ def parse_booking_info(xml_text: str) -> dict:
         "currency": currency,
     }
 
+def is_booking_com_xml(xml_text: str) -> bool:
+    """
+    Возвращает True, если XML относится к Booking.com.
+    Критерии:
+      - Source/BookingChannel/CompanyName[@Code='19'], либо
+      - текст CompanyName содержит 'booking.com'.
+    """
+    if not xml_text:
+        return False
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        try:
+            xml_text = re.sub(r'^\s*[^<]+<', '<', xml_text, count=1)
+            root = ET.fromstring(xml_text)
+        except Exception:
+            return False
+
+    ns = {
+        "ota": "http://www.opentravel.org/OTA/2003/05",
+        "soap": "http://www.w3.org/2003/05/soap-envelope",
+    }
+
+    comp = root.find(".//ota:Source/ota:BookingChannel/ota:CompanyName", ns)
+    if comp is None:
+        return False
+
+    # По коду
+    code = (comp.attrib.get("Code") or "").strip()
+    if code == "19":
+        return True
+
+    # По тексту
+    text = (comp.text or "").strip().lower()
+    if "booking.com" in text:
+        return True
+
+    return False
+
+
 
 # ---------- TXT отчёты ----------
 def write_hotel_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
@@ -199,12 +240,20 @@ def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[Lis
         for xml_path in sorted(pms_dir.glob("*.xml")):
             try:
                 xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
+
+                # ← фильтруем только Booking.com
+                if not is_booking_com_xml(xml_text):
+                    continue
+
                 row = parse_booking_info(xml_text)
-                if any((row.get("start"), row.get("end"), row.get("given"),
-                        row.get("phone"), row.get("total"))):
+
+                # пустые записи не учитываем
+                if any((row.get("start"), row.get("end"), row.get("given"), row.get("surname"),
+                        row.get("phone"), row.get("email"), row.get("total"))):
                     rows.append(row)
             except Exception:
                 pass
+
 
         if rows:
             total_rows += len(rows)
