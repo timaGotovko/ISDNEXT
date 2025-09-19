@@ -179,12 +179,10 @@ def is_booking_com_xml(xml_text: str) -> bool:
     if comp is None:
         return False
 
-    # По коду
     code = (comp.attrib.get("Code") or "").strip()
     if code == "19":
         return True
 
-    # По тексту
     text = (comp.text or "").strip().lower()
     if "booking.com" in text:
         return True
@@ -486,7 +484,6 @@ async def open_channel_dropdown(page):
     """
     Открываем дропдаун 'Select channel'.
     """
-    # клик по mat-select возле надписи 'Select channel'
     for sel in [
         "xpath=(//*[contains(text(),'Select channel')]/following::*[contains(@class,'mat-select')])[1]",
         "xpath=//*[contains(text(),'Select channel')]/ancestor-or-self::*[contains(@class,'mat-form-field')]//div[contains(@class,'mat-select')]",
@@ -503,7 +500,7 @@ async def open_channel_dropdown(page):
                 return panel
         except Exception:
             continue
-    # запасной приём — клик по тексту и Enter
+    # fallback
     try:
         lab = page.get_by_text("Select channel", exact=False).first
         await lab.click(timeout=800)
@@ -796,7 +793,7 @@ async def get_dates_and_start(m: Message, state: FSMContext):
 
 async def run_job_and_reply(m: Message, username: str, password: str, date_from: str, date_to: str, cm_code: str, run_dir: Path):
     try:
-        # 1) Получаем PMS->Name
+        # 1) Получаем PMS->Name + список каналов
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
@@ -818,7 +815,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
 
                 labels = await list_hotels_from_dropdown(page)
 
-                # --- НОВОЕ: список CM-кодов ---
+                # --- Чтение CM-кодов из "Select channel"
                 try:
                     channels_raw = await list_channels_from_dropdown(page)
                 except Exception:
@@ -875,7 +872,6 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 writer_tasks = [asyncio.create_task(writer_worker(write_queue)) for _ in range(WRITERS)]
 
                 total_saved = 0
-                # --- НОВОЕ: используем все CM-коды ---
                 tasks = [
                     fetch_xml_for_pms_multi_cm(
                         req, pms, sem_xml, write_queue, sem_booklog,
