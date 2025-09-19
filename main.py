@@ -167,7 +167,7 @@ def write_hotel_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
         for r in rows:
             arrival  = r.get("start", "")
             depart   = r.get("end", "")
-            name     = r.get("given", "")
+            name = f"{(r.get('given') or '').strip()} {(r.get('surname') or '').strip()}".strip()
             phone    = r.get("phone", "")
             amount   = r.get("total", "")
             curr     = r.get("currency", "")
