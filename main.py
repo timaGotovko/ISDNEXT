@@ -53,6 +53,8 @@ WORK_ROOT.mkdir(exist_ok=True)
 OLD_XML_DIR = Path("xml_api")  # из старых запусков — будем чистить
 
 SAFE_CHARS = re.compile(r'[\\/*?:"<>|]+')
+TEST_ONLY_PMS = 7
+
 
 
 # ---------------- FSM ----------------
@@ -133,7 +135,6 @@ def parse_booking_info(xml_text: str) -> dict:
     total_el = root.find(".//ota:Total", ns)
     if total_el is not None and isinstance(total_el.attrib, dict):
         currency = (total_el.attrib.get("CurrencyCode") or "").strip()
-        # берём наиболее полное значение из доступных атрибутов
         for k in ("AmountIncludingMarkup", "AmountAfterTax", "AmountBeforeTax"):
             v = total_el.attrib.get(k)
             if v:
@@ -152,38 +153,35 @@ def parse_booking_info(xml_text: str) -> dict:
     }
 
 
-def write_hotel_excel(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
+# ---------- TXT отчёты ----------
+def write_hotel_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
     """
-    Excel c колонками: Departure, Arrival, GivenName, Surname, Phone, Email, TotalAmount, Currency
+    TXT-файл с разделителем '|'
+    Формат строки: HotelName|Arrival|Departure|GivenName|Phone|TotalAmount Currency
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    fn = safe_filename(hotel_name) + ".xlsx"
+    fn = safe_filename(hotel_name) + ".txt"
     path = out_dir / fn
 
-    df = pd.DataFrame(rows)
-    df = df.rename(columns={
-        "end": "Departure",
-        "start": "Arrival",
-        "given": "GivenName",
-        "surname": "Surname",
-        "phone": "Phone",
-        "email": "Email",
-        "total": "TotalAmount",
-        "currency": "Currency",
-    })
-    cols = ["Departure", "Arrival", "GivenName", "Surname", "Phone", "Email", "TotalAmount", "Currency"]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = ""
-    df = df[cols]
-    df.to_excel(path, index=False)
+    with path.open("w", encoding="utf-8", newline="") as f:
+        for r in rows:
+            arrival  = r.get("start", "")
+            depart   = r.get("end", "")
+            name     = r.get("given", "")
+            phone    = r.get("phone", "")
+            amount   = r.get("total", "")
+            curr     = r.get("currency", "")
+            price    = (amount + (" " + curr if curr else "")).strip()
+
+            line = f"{hotel_name}|{arrival}|{depart}|{name}|{phone}|{price}"
+            f.write(line + "\n")
     return path
 
 
 def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List[Path], int, int]:
     """
-    Перебираем все XML сохранённые по PMS, делаем Excel для каждого отеля.
-    Возвращаем: (список путей к Excel, total_rows, total_emails)
+    Перебираем все XML сохранённые по PMS, делаем TXT для каждого отеля.
+    Возвращаем: (список путей к TXT, total_rows, total_emails)
     """
     out_paths = []
     save_dir = run_dir / "xml"
@@ -202,19 +200,17 @@ def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[Lis
             try:
                 xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
                 row = parse_booking_info(xml_text)
-                # пустые записи не учитываем
-                if any((row.get("start"), row.get("end"), row.get("given"), row.get("surname"),
-                        row.get("phone"), row.get("email"), row.get("total"))):
+                if any((row.get("start"), row.get("end"), row.get("given"),
+                        row.get("phone"), row.get("total"))):
                     rows.append(row)
             except Exception:
                 pass
 
         if rows:
-            # считаем для итогов
             total_rows += len(rows)
             total_emails += sum(1 for r in rows if (r.get("email") or "").strip())
 
-            out = write_hotel_excel(hotel_name, rows, report_dir)
+            out = write_hotel_txt(hotel_name, rows, report_dir)
             out_paths.append(out)
 
     return out_paths, total_rows, total_emails
@@ -689,6 +685,14 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 pms_to_name[p] = name
         all_pms = sorted(set(all_pms))
         await m.answer(f"Найдено {len(all_pms)} отелей (PMS). Начинаю загрузку XML...")
+        if TEST_ONLY_PMS is not None:
+            if TEST_ONLY_PMS in pms_to_name:
+                all_pms = [TEST_ONLY_PMS]
+                pms_to_name = {TEST_ONLY_PMS: pms_to_name[TEST_ONLY_PMS]}
+                await m.answer(f"Тестовый режим: работаем только с PMS={TEST_ONLY_PMS} ({pms_to_name[TEST_ONLY_PMS]})")
+            else:
+                await m.answer(f"Тестовый режим: PMS={TEST_ONLY_PMS} не найден среди доступных ({len(pms_to_name)} шт.). Останавливаю.")
+                return
 
         # 2) Получаем XML и пишем
         try:
@@ -725,9 +729,9 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
             await send_error(m, "Загрузка XML", e)
             return
 
-        await m.answer("Загрузка XML завершена. Формирую Excel-отчёты...")
+        await m.answer("Загрузка XML завершена. Формирую TXT-отчёты...")
 
-        # 3) Excel-отчёты + подсчёты
+        # 3) TXT-отчёты + подсчёты
         try:
             reports, total_rows, total_emails = build_hotel_reports(pms_to_name, run_dir)
             if not reports:
@@ -735,7 +739,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 safe_rmtree(run_dir)
                 return
         except Exception as e:
-            await send_error(m, "Формирование Excel", e)
+            await send_error(m, "Формирование TXT", e)
             return
 
         await m.answer(f"Сформировано отчётов: {len(reports)}.\n"
@@ -748,7 +752,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
             archive_path = run_dir / "reports"
             final_archive = create_zip(reports, archive_path)
             await m.answer_document(FSInputFile(final_archive),
-                                    caption=f"Готово! Excel: {len(reports)} | Номеров: {total_rows} | Email: {total_emails}")
+                                    caption=f"Готово! TXT: {len(reports)} | Номеров: {total_rows} | Email: {total_emails}")
         except Exception as e:
             await send_error(m, "Архивирование/отправка", e)
             return
