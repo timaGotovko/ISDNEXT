@@ -52,7 +52,7 @@ WORK_ROOT.mkdir(exist_ok=True)
 OLD_XML_DIR = Path("xml_api")  # из старых запусков — будем чистить
 
 SAFE_CHARS = re.compile(r'[\\/*?:"<>|]+')
-TEST_ONLY_PMS = 23  # для теста поменяйте на 7 или None
+TEST_ONLY_PMS = None  # для теста поменяйте на 7 или None
 
 
 # ---------------- FSM ----------------
