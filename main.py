@@ -53,8 +53,7 @@ WORK_ROOT.mkdir(exist_ok=True)
 OLD_XML_DIR = Path("xml_api")  # из старых запусков — будем чистить
 
 SAFE_CHARS = re.compile(r'[\\/*?:"<>|]+')
-TEST_ONLY_PMS = None
-
+TEST_ONLY_PMS = 23  # для теста поставь TEST_ONLY_PMS = 7
 
 
 # ---------------- FSM ----------------
@@ -193,12 +192,11 @@ def is_booking_com_xml(xml_text: str) -> bool:
     return False
 
 
-
 # ---------- TXT отчёты ----------
 def write_hotel_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
     """
     TXT-файл с разделителем '|'
-    Формат строки: HotelName|Arrival|Departure|GivenName|Phone|TotalAmount Currency
+    Формат строки: HotelName|Arrival|Departure|GivenName Surname|Phone|TotalAmount Currency
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     fn = safe_filename(hotel_name) + ".txt"
@@ -253,7 +251,6 @@ def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[Lis
                     rows.append(row)
             except Exception:
                 pass
-
 
         if rows:
             total_rows += len(rows)
@@ -484,6 +481,66 @@ async def list_hotels_from_dropdown(page) -> List[str]:
         pass
     return texts
 
+# ---------- ЧТЕНИЕ КАНАЛОВ ----------
+async def open_channel_dropdown(page):
+    """
+    Открываем дропдаун 'Select channel'.
+    """
+    # клик по mat-select возле надписи 'Select channel'
+    for sel in [
+        "xpath=(//*[contains(text(),'Select channel')]/following::*[contains(@class,'mat-select')])[1]",
+        "xpath=//*[contains(text(),'Select channel')]/ancestor-or-self::*[contains(@class,'mat-form-field')]//div[contains(@class,'mat-select')]",
+        "xpath=(//*[contains(text(),'Select channel')]/following::*[contains(@class,'mat-select-value')])[1]",
+        "css=mat-select"
+    ]:
+        try:
+            el = page.locator(sel).first
+            if await el.is_visible():
+                await el.click(timeout=1500)
+                await asyncio.sleep(0.2)
+                panel = page.locator("css=.mat-select-panel, .cdk-overlay-pane .mat-select-panel").first
+                await panel.wait_for(state="visible", timeout=2000)
+                return panel
+        except Exception:
+            continue
+    # запасной приём — клик по тексту и Enter
+    try:
+        lab = page.get_by_text("Select channel", exact=False).first
+        await lab.click(timeout=800)
+        await page.keyboard.press("Enter")
+        panel = page.locator("css=.mat-select-panel, .cdk-overlay-pane .mat-select-panel").first
+        await panel.wait_for(state="visible", timeout=1500)
+        return panel
+    except Exception:
+        pass
+    raise RuntimeError("Не удалось открыть дропдаун 'Select channel'.")
+
+async def list_channels_from_dropdown(page) -> list[str]:
+    """
+    Возвращает список строк вида 'CM1000 - STAAH', 'CM9902 - Sabre', ...
+    """
+    panel = await open_channel_dropdown(page)
+    try:
+        texts = await panel.evaluate(
+            """(root) => Array.from(root.querySelectorAll('mat-option .mat-option-text, .mat-option-text'))
+                          .map(el => (el.textContent||'').trim())
+                          .filter(Boolean)"""
+        )
+    finally:
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+    return texts or []
+
+CM_CODE_RE = re.compile(r"\bCM\d{3,6}\b")
+def extract_cm_from_label(text: str) -> Optional[str]:
+    """
+    'CM1000 - STAAH' -> 'CM1000'
+    """
+    m = CM_CODE_RE.search(text or "")
+    return m.group(0) if m else None
+
 
 # ---------------- API ----------------
 async def post_json_with_retry(
@@ -626,6 +683,47 @@ async def fetch_xml_for_pms_ctx(req, pms: int, sem_xml: asyncio.Semaphore, write
     except Exception:
         return 0
 
+# ---- новая функция: одной PMS по нескольким CM-кодам ----
+async def fetch_xml_for_pms_multi_cm(
+    req,
+    pms: int,
+    sem_xml: asyncio.Semaphore,
+    write_queue: asyncio.Queue,
+    sem_booklog: asyncio.Semaphore,
+    date_from: str,
+    date_to: str,
+    cm_codes: list[str],
+    run_dir: Path
+) -> int:
+    try:
+        all_tokens: set[int] = set()
+        for cm in cm_codes:
+            async with sem_booklog:
+                booking_log = await api_is_bookinglog_ctx(req, pms, date_from, date_to, cm)
+            if not booking_log:
+                continue
+            for row in booking_log:
+                token_raw = row.get("echoToken")
+                try:
+                    token = int(float(token_raw))
+                    if token:
+                        all_tokens.add(token)
+                except Exception:
+                    continue
+
+        if not all_tokens:
+            return 0
+
+        tasks = [
+            _fetch_single_xml_ctx(req, pms, token, sem_xml, write_queue, run_dir)
+            for token in all_tokens
+        ]
+        result = await asyncio.gather(*tasks, return_exceptions=True)
+        saved = sum(1 for r in result if isinstance(r, bool) and r)
+        return saved
+    except Exception:
+        return 0
+
 
 # ---------------- TELEGRAM BOT ----------------
 bot = Bot(token=TOKEN)
@@ -719,6 +817,13 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 await context.route("**/*", route_handler)
 
                 labels = await list_hotels_from_dropdown(page)
+
+                # --- НОВОЕ: список CM-кодов ---
+                try:
+                    channels_raw = await list_channels_from_dropdown(page)
+                except Exception:
+                    channels_raw = []
+
                 await browser.close()
         except Exception as e:
             await send_error(m, "Сбор списка PMS/отелей", e)
@@ -733,7 +838,21 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 name = txt.split("-", 1)[-1].strip()
                 pms_to_name[p] = name
         all_pms = sorted(set(all_pms))
-        await m.answer(f"Найдено {len(all_pms)} отелей (PMS). Начинаю загрузку XML...")
+
+        # Парсим CM-коды
+        cm_codes: list[str] = []
+        for row in channels_raw:
+            cm = extract_cm_from_label(row)
+            if cm:
+                cm_codes.append(cm)
+        cm_codes = sorted(set(cm_codes)) or [DEFAULT_CM_CODE]
+
+        await m.answer(
+            f"Найдено {len(all_pms)} отелей (PMS). Каналов: {len(cm_codes)} "
+            f"({', '.join(cm_codes[:6])}{'…' if len(cm_codes)>6 else ''}). Начинаю загрузку XML..."
+        )
+
+        # Тестовый режим по PMS
         if TEST_ONLY_PMS is not None:
             if TEST_ONLY_PMS in pms_to_name:
                 all_pms = [TEST_ONLY_PMS]
@@ -756,8 +875,12 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 writer_tasks = [asyncio.create_task(writer_worker(write_queue)) for _ in range(WRITERS)]
 
                 total_saved = 0
+                # --- НОВОЕ: используем все CM-коды ---
                 tasks = [
-                    fetch_xml_for_pms_ctx(req, pms, sem_xml, write_queue, sem_booklog, date_from, date_to, cm_code, run_dir)
+                    fetch_xml_for_pms_multi_cm(
+                        req, pms, sem_xml, write_queue, sem_booklog,
+                        date_from, date_to, cm_codes, run_dir
+                    )
                     for pms in all_pms
                 ]
 
@@ -793,7 +916,6 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
 
         await m.answer(f"Сформировано отчётов: {len(reports)}.\n"
                        f"Всего номеров: {total_rows}\n"
-                    #    f"Всего email'ов: {total_emails}\n"
                        f"Упаковываю в ZIP...")
 
         # 4) Архив (ZIP) и отправка
