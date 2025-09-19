@@ -53,7 +53,7 @@ WORK_ROOT.mkdir(exist_ok=True)
 OLD_XML_DIR = Path("xml_api")  # из старых запусков — будем чистить
 
 SAFE_CHARS = re.compile(r'[\\/*?:"<>|]+')
-TEST_ONLY_PMS = 7
+TEST_ONLY_PMS = None
 
 
 
@@ -793,7 +793,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
 
         await m.answer(f"Сформировано отчётов: {len(reports)}.\n"
                        f"Всего номеров: {total_rows}\n"
-                       f"Всего email'ов: {total_emails}\n"
+                    #    f"Всего email'ов: {total_emails}\n"
                        f"Упаковываю в ZIP...")
 
         # 4) Архив (ZIP) и отправка
@@ -801,7 +801,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
             archive_path = run_dir / "reports"
             final_archive = create_zip(reports, archive_path)
             await m.answer_document(FSInputFile(final_archive),
-                                    caption=f"Готово! TXT: {len(reports)} | Номеров: {total_rows} | Email: {total_emails}")
+                                    caption=f"Готово! TXT: {len(reports)} | Номеров: {total_rows}")
         except Exception as e:
             await send_error(m, "Архивирование/отправка", e)
             return
