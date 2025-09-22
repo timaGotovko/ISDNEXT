@@ -13,7 +13,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 import pandas as pd
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, FSInputFile
+from aiogram.types import Message, FSInputFile, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from aiogram.filters import CommandStart
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
@@ -56,13 +56,39 @@ SAFE_CHARS = re.compile(r'[\\/*?:"<>|]+')
 # TEST_ONLY_PMS = 7
 TEST_ONLY_PMS = None
 
-
+# ======= доп. фильтр доменов для "все остальные почты" =======
+EXCLUDE_EMAIL_DOMAINS = {
+    "@m.expediapartnercentral.com",
+    "@agoda-messaging.com",
+    "@guest.booking.com",
+    "@makemytrip.com",
+    "@cleartrip.com",
+}
 
 # ---------------- FSM ----------------
 class AuthFlow(StatesGroup):
-    waiting_username = State()
-    waiting_password = State()
-    waiting_dates    = State()
+    waiting_username   = State()
+    waiting_password   = State()
+    waiting_dates      = State()
+    waiting_choice     = State()   # номера или почты
+    waiting_email_kind = State()   # если почты: booking / other
+
+# Кнопки
+KB_PARSE_CHOICE = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📞 Спарсить только номера")],
+        [KeyboardButton(text="✉️ Спарсить только почты")]
+    ],
+    resize_keyboard=True
+)
+
+KB_EMAIL_KIND = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Booking почты")],
+        [KeyboardButton(text="Все остальные почты")]
+    ],
+    resize_keyboard=True
+)
 
 
 # ---------------- UTILS ----------------
@@ -181,18 +207,15 @@ def is_booking_com_xml(xml_text: str) -> bool:
     if comp is None:
         return False
 
-    # По коду
     code = (comp.attrib.get("Code") or "").strip()
     if code == "19":
         return True
 
-    # По тексту
     text = (comp.text or "").strip().lower()
     if "booking.com" in text:
         return True
 
     return False
-
 
 
 # ---------- TXT отчёты ----------
@@ -217,6 +240,23 @@ def write_hotel_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
 
             line = f"{hotel_name}|{arrival}|{depart}|{name}|{phone}|{price}"
             f.write(line + "\n")
+    return path
+
+def write_hotel_emails_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
+    """
+    TXT для почт: Hotel|Arrival|Departure|Name|Email|Phone
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fn = safe_filename(hotel_name) + ".txt"
+    path = out_dir / fn
+    with path.open("w", encoding="utf-8", newline="") as f:
+        for r in rows:
+            arrival = r.get("start", "")
+            depart  = r.get("end", "")
+            name    = f"{(r.get('given') or '').strip()} {(r.get('surname') or '').strip()}".strip()
+            email   = r.get("email", "")
+            phone   = r.get("phone", "")
+            f.write(f"{hotel_name}|{arrival}|{depart}|{name}|{email}|{phone}\n")
     return path
 
 
@@ -255,7 +295,6 @@ def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[Lis
             except Exception:
                 pass
 
-
         if rows:
             total_rows += len(rows)
             total_emails += sum(1 for r in rows if (r.get("email") or "").strip())
@@ -264,6 +303,52 @@ def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[Lis
             out_paths.append(out)
 
     return out_paths, total_rows, total_emails
+
+
+def build_email_reports(pms_to_name: dict[int, str], run_dir: Path, email_kind: str) -> Tuple[List[Path], int]:
+    """
+    Собираем email-адреса. БЕЗ фильтра is_booking_com_xml.
+    email_kind == "booking" -> только *@guest.booking.com
+    email_kind == "other"   -> все, КРОМЕ доменов EXCLUDE_EMAIL_DOMAINS
+    Возвращает: (список файлов, всего_email)
+    """
+    out_paths = []
+    save_dir = run_dir / "xml"
+    report_dir = run_dir / "reports"
+    report_dir.mkdir(exist_ok=True, parents=True)
+
+    total_emails = 0
+
+    for pms, hotel_name in pms_to_name.items():
+        pms_dir = save_dir / str(pms)
+        if not pms_dir.exists():
+            continue
+
+        rows = []
+        for xml_path in sorted(pms_dir.glob("*.xml")):
+            try:
+                xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
+                row = parse_booking_info(xml_text)
+                em = (row.get("email") or "").strip().lower()
+                if not em:
+                    continue
+
+                if email_kind == "booking":
+                    if em.endswith("@guest.booking.com"):
+                        rows.append(row)
+                else:
+                    # other: все, КРОМЕ доменов из списка
+                    if not any(em.endswith(dom) for dom in EXCLUDE_EMAIL_DOMAINS):
+                        rows.append(row)
+            except Exception:
+                pass
+
+        if rows:
+            total_emails += len(rows)
+            out = write_hotel_emails_txt(hotel_name, rows, report_dir)
+            out_paths.append(out)
+
+    return out_paths, total_emails
 
 
 def create_zip(files: List[Path], archive_path: Path) -> Path:
@@ -683,21 +768,66 @@ async def get_dates_and_start(m: Message, state: FSMContext):
     date_from, date_to = parts
     await state.update_data(date_from=date_from, date_to=date_to)
 
-    data = await state.get_data()
-    username = data["username"]
-    password = data["password"]
+    await m.answer("Выбери, что спарсить:", reply_markup=KB_PARSE_CHOICE)
+    await state.set_state(AuthFlow.waiting_choice)
 
-    # Очистка старых директорий
+@dp.message(AuthFlow.waiting_choice)
+async def select_numbers_or_emails(m: Message, state: FSMContext):
+    text = (m.text or "").strip().lower()
+    if "номера" in text:
+        await state.update_data(parse_mode="numbers")
+        await m.answer("Ок, парсим только номера.", reply_markup=ReplyKeyboardRemove())
+        data = await state.get_data()
+        await start_job_from_state(m, data, parse_mode="numbers")
+        await state.clear()
+    elif "почт" in text:
+        await state.update_data(parse_mode="emails")
+        await m.answer("Выбери тип почт:", reply_markup=KB_EMAIL_KIND)
+        await state.set_state(AuthFlow.waiting_email_kind)
+    else:
+        await m.answer("Нажми одну из кнопок ниже.", reply_markup=KB_PARSE_CHOICE)
+
+@dp.message(AuthFlow.waiting_email_kind)
+async def select_email_kind(m: Message, state: FSMContext):
+    text = (m.text or "").strip().lower()
+    if "booking" in text:
+        await state.update_data(email_kind="booking")
+    elif "остальны" in text:
+        await state.update_data(email_kind="other")
+    else:
+        await m.answer("Нажми одну из кнопок ниже.", reply_markup=KB_EMAIL_KIND)
+        return
+
+    await m.answer("Ок, запускаю парсинг.", reply_markup=ReplyKeyboardRemove())
+    data = await state.get_data()
+    await start_job_from_state(m, data, parse_mode="emails")
+    await state.clear()
+
+async def start_job_from_state(m: Message, data: dict, parse_mode: str):
+    username  = data["username"]
+    password  = data["password"]
+    date_from = data["date_from"]
+    date_to   = data["date_to"]
+    email_kind = data.get("email_kind")
+
     safe_rmtree(OLD_XML_DIR)
     run_dir = WORK_ROOT / f"run_{m.chat.id}_{m.message_id}"
     safe_rmtree(run_dir)
     run_dir.mkdir(exist_ok=True, parents=True)
 
-    asyncio.create_task(run_job_and_reply(m, username, password, date_from, date_to, DEFAULT_CM_CODE, run_dir))
+    asyncio.create_task(
+        run_job_and_reply(
+            m, username, password, date_from, date_to,
+            DEFAULT_CM_CODE, run_dir,
+            parse_mode=parse_mode, email_kind=email_kind
+        )
+    )
     await m.answer("Запустил парсинг. Это займёт некоторое время. Буду присылать прогресс.")
-    await state.clear()
 
-async def run_job_and_reply(m: Message, username: str, password: str, date_from: str, date_to: str, cm_code: str, run_dir: Path):
+
+async def run_job_and_reply(m: Message, username: str, password: str, date_from: str, date_to: str,
+                            cm_code: str, run_dir: Path, parse_mode: str = "numbers",
+                            email_kind: Optional[str] = None):
     try:
         # 1) Получаем PMS->Name
         try:
@@ -783,28 +913,32 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
 
         # 3) TXT-отчёты + подсчёты
         try:
-            reports, total_rows, total_emails = build_hotel_reports(pms_to_name, run_dir)
-            if not reports:
-                await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
-                safe_rmtree(run_dir)
-                return
+            if parse_mode == "numbers":
+                reports, total_rows, _ = build_hotel_reports(pms_to_name, run_dir)
+                if not reports:
+                    await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
+                    safe_rmtree(run_dir)
+                    return
+                await m.answer(f"Сформировано отчётов: {len(reports)}.\nВсего номеров: {total_rows}\nУпаковываю в ZIP...")
+                final_caption = f"Готово! TXT: {len(reports)} | Номеров: {total_rows}"
+            else:
+                reports, total_emails = build_email_reports(pms_to_name, run_dir, email_kind=email_kind or "other")
+                if not reports:
+                    await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
+                    safe_rmtree(run_dir)
+                    return
+                label = "Booking-почты" if (email_kind or "") == "booking" else "Все остальные почты"
+                await m.answer(f"Сформировано отчётов: {len(reports)}.\nВсего e-mail: {total_emails} ({label})\nУпаковываю в ZIP...")
+                final_caption = f"Готово! TXT: {len(reports)} | Email: {total_emails} ({label})"
         except Exception as e:
             await send_error(m, "Формирование TXT", e)
             return
-
-        await m.answer(f"Сформировано отчётов: {len(reports)}.\n"
-                       f"Всего номеров: {total_rows}\n"
-                    #    f"Всего email'ов: {total_emails}\n"
-                    #    f"Всего email'ов: {total_emails}\n"
-                       f"Упаковываю в ZIP...")
 
         # 4) Архив (ZIP) и отправка
         try:
             archive_path = run_dir / "reports"
             final_archive = create_zip(reports, archive_path)
-            await m.answer_document(FSInputFile(final_archive),
-                                    # caption=f"Готово! TXT: {len(reports)} | Номеров: {total_rows} | Email: {total_emails}")
-                                    caption=f"Готово! TXT: {len(reports)} | Номеров: {total_rows}")
+            await m.answer_document(FSInputFile(final_archive), caption=final_caption)
         except Exception as e:
             await send_error(m, "Архивирование/отправка", e)
             return
