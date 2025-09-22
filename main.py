@@ -30,13 +30,13 @@ URL       = "https://datahubdashboard.idsnext.live"
 MENU_ITEM = "Bookings from Channels to (FN & FX)"
 
 # СКОРОСТЬ/ОГРАНИЧЕНИЯ
-CONCURRENCY       = 32
+CONCURRENCY       = 64
 REQ_TIMEOUT_MS    = 60_000
 RETRY_ATTEMPTS    = 3
 RETRY_BASE_DELAY  = 0.5
 RETRY_JITTER      = 0.3
 
-BOOKLOG_CONCURRENCY    = 4
+BOOKLOG_CONCURRENCY    = 12
 BOOKLOG_TIMEOUT_MS     = 120_000
 BOOKLOG_RETRY_ATTEMPTS = 5
 BOOKLOG_JITTER         = 0.6
@@ -673,17 +673,35 @@ async def writer_worker(queue: asyncio.Queue):
         finally:
             queue.task_done()
 
-async def _fetch_single_xml_ctx(req, pms: int, token: int, sem_xml: asyncio.Semaphore, write_queue: asyncio.Queue, run_dir: Path) -> bool:
+async def _fetch_single_xml_ctx(req, pms: int, token: int,
+                                sem_xml: asyncio.Semaphore,
+                                write_queue: asyncio.Queue,
+                                run_dir: Path) -> bool:
     async with sem_xml:
         try:
             xml = await api_get_xml_ctx(req, pms, token, DEFAULT_CM_CODE, "ReceivedXML")
             if not xml:
                 return False
+
+            # --- РАННИЙ ФИЛЬТР ---
+            # быстрый «дешёвый» чек, чтобы даже не парсить XML, если очевидно не Booking
+            low = xml.lower()
+            if ('booking.com' not in low) and ('code="19"' not in low):
+                return False
+            # на всякий случай точный парс (одна функция уже есть в коде)
+            try:
+                if not is_booking_com_xml(xml):
+                    return False
+            except Exception:
+                return False
+            # ----------------------
+
             pms_dir = run_dir / "xml" / str(pms)
             await write_queue.put((pms_dir, token, xml))
             return True
         except Exception:
             return False
+
 
 async def fetch_xml_for_pms_ctx(req, pms: int, sem_xml: asyncio.Semaphore, write_queue: asyncio.Queue,
                                 sem_booklog: asyncio.Semaphore, date_from: str, date_to: str, cm_code: str, run_dir: Path) -> int:
