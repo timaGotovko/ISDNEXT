@@ -8,6 +8,8 @@ import asyncio
 import zipfile
 import traceback
 import xml.etree.ElementTree as ET
+import time
+import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 
@@ -65,6 +67,13 @@ EXCLUDE_EMAIL_DOMAINS = {
     "@cleartrip.com",
 }
 
+# ---------------- LOGGER ----------------
+logger = logging.getLogger("dhbot")
+
+def log_duration(tag: str, start: float, extra: str = ""):
+    elapsed = time.perf_counter() - start
+    logger.info(f"[TIMER] {tag} | {elapsed:.3f}s {extra}".strip())
+
 # ---------------- FSM ----------------
 class AuthFlow(StatesGroup):
     waiting_username   = State()
@@ -105,6 +114,7 @@ def extract_pms_from_label(label: str) -> Optional[int]:
 async def send_error(m: Message, where: str, exc: Exception):
     tb = "".join(traceback.format_exception_only(type(exc), exc)).strip()
     msg = f"❌ Ошибка на шаге *{where}*: `{tb}`"
+    logger.exception(f"[ERROR] {where}: {exc}")
     if len(msg) > 3500:
         msg = msg[:3490] + "…`"
     await m.answer(msg, parse_mode="Markdown")
@@ -113,8 +123,9 @@ def safe_rmtree(path: Path):
     try:
         if path.exists():
             shutil.rmtree(path, ignore_errors=True)
-    except Exception:
-        pass
+            logger.info(f"[CLEANUP] Removed directory: {path}")
+    except Exception as e:
+        logger.warning(f"[CLEANUP] Failed to remove {path}: {e}")
 
 
 # ========= ПАРСИНГ XML =========
@@ -220,10 +231,6 @@ def is_booking_com_xml(xml_text: str) -> bool:
 
 # ---------- TXT отчёты ----------
 def write_hotel_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
-    """
-    TXT-файл с разделителем '|'
-    Формат строки: HotelName|Arrival|Departure|GivenName|Phone|TotalAmount Currency
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
     fn = safe_filename(hotel_name) + ".txt"
     path = out_dir / fn
@@ -237,15 +244,12 @@ def write_hotel_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
             amount   = r.get("total", "")
             curr     = r.get("currency", "")
             price    = (amount + (" " + curr if curr else "")).strip()
-
             line = f"{hotel_name}|{arrival}|{depart}|{name}|{phone}|{price}"
             f.write(line + "\n")
+    logger.info(f"[REPORT] Wrote numbers TXT for hotel '{hotel_name}' with {len(rows)} rows -> {path}")
     return path
 
 def write_hotel_emails_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
-    """
-    TXT для почт: Hotel|Arrival|Departure|Name|Email|Phone
-    """
     out_dir.mkdir(parents=True, exist_ok=True)
     fn = safe_filename(hotel_name) + ".txt"
     path = out_dir / fn
@@ -257,14 +261,12 @@ def write_hotel_emails_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> 
             email   = r.get("email", "")
             phone   = r.get("phone", "")
             f.write(f"{hotel_name}|{arrival}|{depart}|{name}|{email}|{phone}\n")
+    logger.info(f"[REPORT] Wrote emails TXT for hotel '{hotel_name}' with {len(rows)} rows -> {path}")
     return path
 
 
 def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List[Path], int, int]:
-    """
-    Перебираем все XML сохранённые по PMS, делаем TXT для каждого отеля.
-    Возвращаем: (список путей к TXT, total_rows, total_emails)
-    """
+    t0 = time.perf_counter()
     out_paths = []
     save_dir = run_dir / "xml"
     report_dir = run_dir / "reports"
@@ -272,60 +274,62 @@ def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[Lis
 
     total_rows = 0
     total_emails = 0
+    logger.info(f"[BUILD_REPORTS] Start numbers (Booking-only). Hotels={len(pms_to_name)}")
 
     for pms, hotel_name in pms_to_name.items():
+        t1 = time.perf_counter()
         pms_dir = save_dir / str(pms)
         if not pms_dir.exists():
+            logger.info(f"[BUILD_REPORTS] No XML directory for PMS={pms}")
             continue
         rows = []
+        count_xml = 0
         for xml_path in sorted(pms_dir.glob("*.xml")):
+            count_xml += 1
             try:
                 xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
-
-                # ← фильтруем только Booking.com
                 if not is_booking_com_xml(xml_text):
                     continue
-
                 row = parse_booking_info(xml_text)
-
-                # пустые записи не учитываем
                 if any((row.get("start"), row.get("end"), row.get("given"), row.get("surname"),
                         row.get("phone"), row.get("email"), row.get("total"))):
                     rows.append(row)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[BUILD_REPORTS] Failed parse XML {xml_path}: {e}")
 
         if rows:
             total_rows += len(rows)
             total_emails += sum(1 for r in rows if (r.get("email") or "").strip())
-
             out = write_hotel_txt(hotel_name, rows, report_dir)
             out_paths.append(out)
+        log_duration("BUILD_REPORTS per PMS", t1, f"(PMS={pms}, files={count_xml}, rows_kept={len(rows)})")
 
+    log_duration("BUILD_REPORTS total", t0, f"(TXT files={len(out_paths)}, rows={total_rows}, emails={total_emails})")
     return out_paths, total_rows, total_emails
 
 
 def build_email_reports(pms_to_name: dict[int, str], run_dir: Path, email_kind: str) -> Tuple[List[Path], int]:
-    """
-    Собираем email-адреса. БЕЗ фильтра is_booking_com_xml.
-    email_kind == "booking" -> только *@guest.booking.com
-    email_kind == "other"   -> все, КРОМЕ доменов EXCLUDE_EMAIL_DOMAINS
-    Возвращает: (список файлов, всего_email)
-    """
+    t0 = time.perf_counter()
     out_paths = []
     save_dir = run_dir / "xml"
     report_dir = run_dir / "reports"
     report_dir.mkdir(exist_ok=True, parents=True)
 
     total_emails = 0
+    logger.info(f"[BUILD_EMAILS] Start emails (kind={email_kind}). Hotels={len(pms_to_name)}")
 
     for pms, hotel_name in pms_to_name.items():
+        t1 = time.perf_counter()
         pms_dir = save_dir / str(pms)
         if not pms_dir.exists():
+            logger.info(f"[BUILD_EMAILS] No XML directory for PMS={pms}")
             continue
 
         rows = []
+        count_xml = 0
+        kept = 0
         for xml_path in sorted(pms_dir.glob("*.xml")):
+            count_xml += 1
             try:
                 xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
                 row = parse_booking_info(xml_text)
@@ -336,35 +340,44 @@ def build_email_reports(pms_to_name: dict[int, str], run_dir: Path, email_kind: 
                 if email_kind == "booking":
                     if em.endswith("@guest.booking.com"):
                         rows.append(row)
+                        kept += 1
                 else:
-                    # other: все, КРОМЕ доменов из списка
                     if not any(em.endswith(dom) for dom in EXCLUDE_EMAIL_DOMAINS):
                         rows.append(row)
-            except Exception:
-                pass
+                        kept += 1
+            except Exception as e:
+                logger.warning(f"[BUILD_EMAILS] Failed parse XML {xml_path}: {e}")
 
         if rows:
             total_emails += len(rows)
             out = write_hotel_emails_txt(hotel_name, rows, report_dir)
             out_paths.append(out)
+        log_duration("BUILD_EMAILS per PMS", t1, f"(PMS={pms}, files={count_xml}, rows_kept={kept})")
 
+    log_duration("BUILD_EMAILS total", t0, f"(TXT files={len(out_paths)}, emails={total_emails}, kind={email_kind})")
     return out_paths, total_emails
 
 
 def create_zip(files: List[Path], archive_path: Path) -> Path:
+    t0 = time.perf_counter()
     zpath = archive_path.with_suffix(".zip")
     with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=5) as z:
         for f in files:
             z.write(f, arcname=f.name)
+    log_duration("ZIP", t0, f"(files={len(files)}, out={zpath})")
     return zpath
 
 
 # ---------------- Playwright/UI ----------------
 async def do_login(page, username: str, password: str):
+    t0 = time.perf_counter()
+    logger.info("[LOGIN] Start goto/login")
     await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
     await page.wait_for_load_state("networkidle", timeout=60000)
+    log_duration("LOGIN: page load", t0)
 
     # email
+    t1 = time.perf_counter()
     email_inp = None
     try:
         email_inp = page.get_by_placeholder("Enter your email id").first
@@ -387,7 +400,9 @@ async def do_login(page, username: str, password: str):
                 continue
     if not email_inp:
         raise RuntimeError("Не нашёл поле Email")
+    log_duration("LOGIN: email input ready", t1)
 
+    t2 = time.perf_counter()
     pass_inp = None
     for sel in ["css=input[type='password']", "css=input[aria-label*='Password' i]"]:
         loc = page.locator(sel).first
@@ -399,6 +414,7 @@ async def do_login(page, username: str, password: str):
             continue
     if not pass_inp:
         raise RuntimeError("Не нашёл поле Password")
+    log_duration("LOGIN: password input ready", t2)
 
     async def robust_fill_input(inp_loc, value):
         await inp_loc.click()
@@ -414,9 +430,12 @@ async def do_login(page, username: str, password: str):
                 await inp_loc.element_handle(), value
             )
 
+    t3 = time.perf_counter()
     await robust_fill_input(email_inp, username)
     await robust_fill_input(pass_inp, password)
+    log_duration("LOGIN: typed credentials", t3)
 
+    t4 = time.perf_counter()
     clicked = False
     for sel in [
         "css=button[type=submit]",
@@ -441,8 +460,13 @@ async def do_login(page, username: str, password: str):
         pass
 
     await page.wait_for_load_state("networkidle", timeout=30000)
+    log_duration("LOGIN: submit and post-wait", t4)
+    log_duration("LOGIN total", t0)
 
 async def open_menu_and_go(page, item_text: str):
+    t0 = time.perf_counter()
+    logger.info("[NAV] Open side menu and go to target page")
+
     for _ in range(2):
         try:
             await page.mouse.click(28, 96)
@@ -527,7 +551,10 @@ async def open_menu_and_go(page, item_text: str):
     if not ok:
         raise RuntimeError("Переход не подтвердился (нет заголовка).")
 
+    log_duration("NAV: open menu and go", t0)
+
 async def open_property_dropdown(page):
+    t0 = time.perf_counter()
     opener = None
     for sel in [
         "xpath=//ngc-multiselect-dropdown//div[contains(@class,'dropdown-btn')][.//span[contains(normalize-space(),'Select Property')]]",
@@ -555,9 +582,11 @@ async def open_property_dropdown(page):
     await opener.click()
     panel = page.locator("css=.dropdown-list:not([hidden])").last
     await panel.wait_for(state="visible", timeout=3000)
+    log_duration("UI: open property dropdown", t0)
     return panel
 
 async def list_hotels_from_dropdown(page) -> List[str]:
+    t0 = time.perf_counter()
     panel = await open_property_dropdown(page)
     texts = await panel.evaluate(
         """(root) => Array.from(root.querySelectorAll('li'))
@@ -568,6 +597,7 @@ async def list_hotels_from_dropdown(page) -> List[str]:
         await page.keyboard.press("Escape")
     except Exception:
         pass
+    log_duration("UI: list_hotels_from_dropdown", t0, f"(hotels={len(texts)})")
     return texts
 
 
@@ -581,8 +611,11 @@ async def post_json_with_retry(
 ):
     delay = base_delay
     last_err = None
+    t0 = time.perf_counter()
+    logger.info(f"[HTTP] POST -> {url} (timeout={timeout_ms}ms, attempts={attempts})")
 
     for i in range(1, attempts + 1):
+        attempt_start = time.perf_counter()
         try:
             resp = await req.post(
                 url,
@@ -597,28 +630,40 @@ async def post_json_with_retry(
             )
             status = resp.status
             txt = await resp.text()
+            elapsed_attempt = time.perf_counter() - attempt_start
+
             if 200 <= status < 400:
                 try:
-                    return await resp.json()
+                    js = await resp.json()
                 except Exception:
                     try:
-                        return json.loads(txt)
+                        js = json.loads(txt)
                     except Exception:
-                        return txt
+                        js = txt
+                logger.info(f"[HTTP] OK {status} {url} in {elapsed_attempt:.3f}s")
+                log_duration("HTTP total", t0, f"({url})")
+                return js
             last_err = f"HTTP {status}: {txt[:300]}"
+            logger.warning(f"[HTTP] Fail attempt {i}/{attempts} {url} in {elapsed_attempt:.3f}s: {last_err}")
         except PWTimeout as te:
             last_err = f"Timeout: {te}"
+            logger.warning(f"[HTTP] Timeout attempt {i}/{attempts} {url} in {(time.perf_counter()-attempt_start):.3f}s")
         except Exception as e:
             last_err = f"Exception: {e}"
+            logger.warning(f"[HTTP] Exception attempt {i}/{attempts} {url}: {e}")
 
         if i < attempts:
-            await asyncio.sleep(delay + random.uniform(0.0, jitter))
+            sleep_s = delay + random.uniform(0.0, jitter)
+            logger.info(f"[HTTP] Retry in {sleep_s:.2f}s -> {url}")
+            await asyncio.sleep(sleep_s)
             delay *= 2
 
-    print(f"[ERROR] POST {url} failed after {attempts} attempts: {last_err}")
+    logger.error(f"[HTTP] POST {url} failed after {attempts} attempts: {last_err}")
+    log_duration("HTTP total", t0, f"(FAILED {url})")
     return None
 
 async def api_is_bookinglog_ctx(req, pmscode: int, from_date: str, to_date: str, cmcode: str) -> List[Dict[str, Any]]:
+    t0 = time.perf_counter()
     url = f"{API_BASE}/api/Bookinglog/IsBookinglog"
     payload = {
         "PmsCode": pmscode,
@@ -629,7 +674,6 @@ async def api_is_bookinglog_ctx(req, pmscode: int, from_date: str, to_date: str,
         "PaginationToId": "50",
         "Search": ""
     }
-    await asyncio.sleep(random.uniform(0.05, 0.25))
     js = await post_json_with_retry(
         req, url, payload,
         attempts=BOOKLOG_RETRY_ATTEMPTS,
@@ -638,38 +682,49 @@ async def api_is_bookinglog_ctx(req, pmscode: int, from_date: str, to_date: str,
         jitter=BOOKLOG_JITTER,
     )
     if isinstance(js, list):
+        log_duration("API BookingLog", t0, f"(pms={pmscode}, rows={len(js)})")
         return js
+    log_duration("API BookingLog", t0, f"(pms={pmscode}, rows=0; bad-response)")
     return []
 
 async def api_get_xml_ctx(req, pmscode: int, token: int, cmcode: str, xml_type: str = "ReceivedXML") -> str:
+    t0 = time.perf_counter()
     url = f"{API_BASE}/api/AriXml/IsAriBookXml"
     payload = {"pmscode": pmscode, "cmcode": cmcode, "token": token, "Type": xml_type}
     js = await post_json_with_retry(req, url, payload)
+    xml = ""
     if isinstance(js, dict):
         xml = js.get("xmlData") or ""
-        return xml if isinstance(xml, str) else ""
-    if isinstance(js, list) and js:
+    elif isinstance(js, list) and js:
         first = js[0]
         if isinstance(first, dict):
             xml = first.get("xmlData") or ""
-            return xml if isinstance(xml, str) else ""
-    if isinstance(js, str):
-        return js
-    return ""
+    elif isinstance(js, str):
+        xml = js
+    log_duration("API GetXML", t0, f"(pms={pmscode}, token={token}, got={bool(xml)})")
+    return xml
 
 
 # ---------------- Очередь записи ----------------
 async def writer_worker(queue: asyncio.Queue):
+    logger.info("[WRITER] Writer worker started")
+    written = 0
     while True:
         item = await queue.get()
         if item is None:
             queue.task_done()
+            logger.info(f"[WRITER] Writer worker stop. Written={written}")
             break
         pms_dir, token, xml_text = item
         try:
             pms_dir.mkdir(parents=True, exist_ok=True)
             path = pms_dir / f"{token}.xml"
             path.write_text(xml_text, encoding="utf-8")
+            written += 1
+            if written % 500 == 0:
+                logger.info(f"[WRITER] Written so far: {written}")
+        except Exception as e:
+            logger.warning(f"[WRITER] Failed write token={token} -> {e}")
         finally:
             queue.task_done()
 
@@ -682,18 +737,21 @@ async def _fetch_single_xml_ctx(req, pms: int, token: int, sem_xml: asyncio.Sema
             pms_dir = run_dir / "xml" / str(pms)
             await write_queue.put((pms_dir, token, xml))
             return True
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[FETCH_XML] _fetch_single_xml_ctx error pms={pms}, token={token}: {e}")
             return False
 
 async def fetch_xml_for_pms_ctx(req, pms: int, sem_xml: asyncio.Semaphore, write_queue: asyncio.Queue,
                                 sem_booklog: asyncio.Semaphore, date_from: str, date_to: str, cm_code: str, run_dir: Path) -> int:
+    t0 = time.perf_counter()
     try:
         async with sem_booklog:
             booking_log = await api_is_bookinglog_ctx(req, pms, date_from, date_to, cm_code)
         if not booking_log:
+            logger.info(f"[BOOKLOG] pms={pms} -> no rows")
             return 0
 
-        tasks = []
+        tokens = []
         for row in booking_log:
             token_raw = row.get("echoToken")
             try:
@@ -701,15 +759,22 @@ async def fetch_xml_for_pms_ctx(req, pms: int, sem_xml: asyncio.Semaphore, write
             except Exception:
                 token = 0
             if token:
-                tasks.append(_fetch_single_xml_ctx(req, pms, token, sem_xml, write_queue, run_dir))
+                tokens.append(token)
 
-        if not tasks:
+        logger.info(f"[BOOKLOG] pms={pms} -> rows={len(booking_log)}; tokens={len(tokens)}")
+
+        if not tokens:
+            log_duration("FETCH PMS total", t0, f"(pms={pms}, saved=0)")
             return 0
 
+        tasks = [ _fetch_single_xml_ctx(req, pms, token, sem_xml, write_queue, run_dir) for token in tokens ]
         result = await asyncio.gather(*tasks, return_exceptions=True)
         saved = sum(1 for r in result if isinstance(r, bool) and r)
+
+        log_duration("FETCH PMS total", t0, f"(pms={pms}, saved={saved}, tokens={len(tokens)})")
         return saved
-    except Exception:
+    except Exception as e:
+        logger.exception(f"[FETCH_XML] fetch_xml_for_pms_ctx error pms={pms}: {e}")
         return 0
 
 
@@ -732,7 +797,6 @@ async def get_username(m: Message, state: FSMContext):
 @dp.message(AuthFlow.waiting_password)
 async def get_password(m: Message, state: FSMContext):
     await state.update_data(password=m.text.strip())
-
     await m.answer("Пробую авторизоваться...")
 
     data = await state.get_data()
@@ -740,6 +804,7 @@ async def get_password(m: Message, state: FSMContext):
     password = data["password"]
 
     try:
+        t0 = time.perf_counter()
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=True,
@@ -750,7 +815,7 @@ async def get_password(m: Message, state: FSMContext):
             await do_login(page, username, password)
             await open_menu_and_go(page, MENU_ITEM)
             await browser.close()
-
+        log_duration("AUTH total", t0)
         await m.answer("✅ Авторизация прошла успешно! Введи даты в формате: `YYYY-MM-DD YYYY-MM-DD` (например: `2025-09-12 2025-09-13`).", parse_mode="Markdown")
         await state.set_state(AuthFlow.waiting_dates)
     except Exception as e:
@@ -814,6 +879,7 @@ async def start_job_from_state(m: Message, data: dict, parse_mode: str):
     run_dir = WORK_ROOT / f"run_{m.chat.id}_{m.message_id}"
     safe_rmtree(run_dir)
     run_dir.mkdir(exist_ok=True, parents=True)
+    logger.info(f"[RUN] Start job run_dir={run_dir} mode={parse_mode} email_kind={email_kind}")
 
     asyncio.create_task(
         run_job_and_reply(
@@ -828,9 +894,11 @@ async def start_job_from_state(m: Message, data: dict, parse_mode: str):
 async def run_job_and_reply(m: Message, username: str, password: str, date_from: str, date_to: str,
                             cm_code: str, run_dir: Path, parse_mode: str = "numbers",
                             email_kind: Optional[str] = None):
+    t_all = time.perf_counter()
     try:
         # 1) Получаем PMS->Name
         try:
+            t0 = time.perf_counter()
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
                 context = await browser.new_context()
@@ -851,6 +919,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
 
                 labels = await list_hotels_from_dropdown(page)
                 await browser.close()
+            log_duration("STEP 1: Collect PMS list", t0, f"(labels={len(labels)})")
         except Exception as e:
             await send_error(m, "Сбор списка PMS/отелей", e)
             return
@@ -864,6 +933,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 name = txt.split("-", 1)[-1].strip()
                 pms_to_name[p] = name
         all_pms = sorted(set(all_pms))
+        logger.info(f"[PMS] Extracted PMS count={len(all_pms)}")
         await m.answer(f"Найдено {len(all_pms)} отелей (PMS). Начинаю загрузку XML...")
         if TEST_ONLY_PMS is not None:
             if TEST_ONLY_PMS in pms_to_name:
@@ -876,6 +946,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
 
         # 2) Получаем XML и пишем
         try:
+            t0 = time.perf_counter()
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
                 context = await browser.new_context()
@@ -885,6 +956,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 sem_booklog = asyncio.Semaphore(BOOKLOG_CONCURRENCY)
                 write_queue = asyncio.Queue(maxsize=WRITE_QUEUE_MAXSIZE)
                 writer_tasks = [asyncio.create_task(writer_worker(write_queue)) for _ in range(WRITERS)]
+                logger.info(f"[STEP2] Start fetching XML. PMS total={len(all_pms)}")
 
                 total_saved = 0
                 tasks = [
@@ -894,9 +966,12 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
 
                 step = 50
                 for i in range(0, len(tasks), step):
+                    t_chunk = time.perf_counter()
                     chunk = tasks[i:i+step]
                     res = await asyncio.gather(*chunk)
-                    total_saved += sum(res)
+                    saved_chunk = sum(res)
+                    total_saved += saved_chunk
+                    log_duration("STEP2: chunk", t_chunk, f"(chunk={i//step+1}, size={len(chunk)}, saved={saved_chunk})")
                     await m.answer(f"Прогресс: обработано PMS {min(i+step,len(tasks))}/{len(tasks)}, XML сохранено: {total_saved}")
 
                 # Завершаем писателей
@@ -905,6 +980,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 await write_queue.join()
                 await asyncio.gather(*writer_tasks, return_exceptions=True)
                 await browser.close()
+            log_duration("STEP 2: Fetch XML total", t0, f"(XML saved={total_saved})")
         except Exception as e:
             await send_error(m, "Загрузка XML", e)
             return
@@ -913,6 +989,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
 
         # 3) TXT-отчёты + подсчёты
         try:
+            t0 = time.perf_counter()
             if parse_mode == "numbers":
                 reports, total_rows, _ = build_hotel_reports(pms_to_name, run_dir)
                 if not reports:
@@ -930,36 +1007,44 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 label = "Booking-почты" if (email_kind or "") == "booking" else "Все остальные почты"
                 await m.answer(f"Сформировано отчётов: {len(reports)}.\nВсего e-mail: {total_emails} ({label})\nУпаковываю в ZIP...")
                 final_caption = f"Готово! TXT: {len(reports)} | Email: {total_emails} ({label})"
+            log_duration("STEP 3: Build reports", t0, f"(reports={len(reports)})")
         except Exception as e:
             await send_error(m, "Формирование TXT", e)
             return
 
         # 4) Архив (ZIP) и отправка
         try:
+            t0 = time.perf_counter()
             archive_path = run_dir / "reports"
             final_archive = create_zip(reports, archive_path)
             await m.answer_document(FSInputFile(final_archive), caption=final_caption)
+            log_duration("STEP 4: Zip+send", t0)
         except Exception as e:
             await send_error(m, "Архивирование/отправка", e)
             return
     except Exception as e:
         await send_error(m, "Общая ошибка", e)
     finally:
+        log_duration("JOB total", t_all)
         try:
             safe_rmtree(run_dir)
             safe_rmtree(OLD_XML_DIR)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[CLEANUP] Failed post-cleanup: {e}")
 
 
 # ---------------- MAIN ----------------
 def main():
-    import logging
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
     if not TOKEN:
         raise RuntimeError("Не задан BOT_TOKEN (переменная окружения). Создайте .env и задайте BOT_TOKEN=...")
 
     pd.options.mode.copy_on_write = True
+    logger.info("[BOOT] Starting bot polling...")
     dp.run_polling(bot, allowed_updates=["message"])
 
 if __name__ == "__main__":
