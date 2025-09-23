@@ -66,6 +66,16 @@ EXCLUDE_EMAIL_DOMAINS = {
     "@guest.booking.com",
     "@makemytrip.com",
     "@cleartrip.com",
+    "@easemytrip.com",
+    "@hotelpartner@ixigo.com",
+    "@travelplusapp.com",
+    "@agoda.com",
+    "@tbo.com",
+    "@ixigo.com",
+    "@grnconnect.com",
+    "@galaxytravellers.com",
+    "@guest.trip.com",
+    "@riya.travel"
 }
 
 # ---------------- LOGGER ----------------
@@ -247,19 +257,34 @@ def write_hotel_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
     return path
 
 def write_hotel_emails_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
+    """
+    TXT для почт: Hotel|Arrival|Departure|Name|Email|Phone|TotalAmount Currency
+    Формат полностью как в отчёте по телефонам, только добавлен Email.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     fn = safe_filename(hotel_name) + ".txt"
     path = out_dir / fn
+
     with path.open("w", encoding="utf-8", newline="") as f:
         for r in rows:
-            arrival = r.get("start", "")
-            depart  = r.get("end", "")
-            name    = f"{(r.get('given') or '').strip()} {(r.get('surname') or '').strip()}".strip()
-            email   = r.get("email", "")
-            phone   = r.get("phone", "")
-            f.write(f"{hotel_name}|{arrival}|{depart}|{name}|{email}|{phone}\n")
+            arrival  = (r.get("start") or "").strip()
+            depart   = (r.get("end") or "").strip()
+            name     = f"{(r.get('given') or '').strip()} {(r.get('surname') or '').strip()}".strip()
+            email    = (r.get("email") or "").strip()
+            phone    = (r.get("phone") or "").strip()
+            amount   = (r.get("total") or "").strip()
+            curr     = (r.get("currency") or "").strip()
+
+            # цена в том же виде, что и в write_hotel_txt
+            price = (amount + (" " + curr if curr else "")).strip()
+
+            # окончательная строка
+            line = f"{hotel_name}|{arrival}|{depart}|{name}|{email}|{phone}|{price}"
+            f.write(line + "\n")
+
     logger.info(f"[REPORT] Wrote emails TXT for hotel '{hotel_name}' with {len(rows)} rows -> {path}")
     return path
+
 
 
 def build_hotel_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List[Path], int, int]:
