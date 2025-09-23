@@ -21,7 +21,8 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from dotenv import load_dotenv
 
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+from playwright.async_api import async_playwright
+import aiohttp
 
 # ---------------- CONFIG ----------------
 load_dotenv()
@@ -31,23 +32,24 @@ API_BASE  = "https://idsdatahubdashboardapi.azurewebsites.net"
 URL       = "https://datahubdashboard.idsnext.live"
 MENU_ITEM = "Bookings from Channels to (FN & FX)"
 
-# СКОРОСТЬ/ОГРАНИЧЕНИЯ
-CONCURRENCY       = 32
+# Параллельность
+PMS_CONCURRENCY       = 24   # параллельных PMS
+TOKEN_CONCURRENCY     = 160  # параллельных запросов XML (токенов)
+
+# HTTP лимиты/ретраи
 REQ_TIMEOUT_MS    = 60_000
 RETRY_ATTEMPTS    = 3
 RETRY_BASE_DELAY  = 0.5
 RETRY_JITTER      = 0.3
 
-BOOKLOG_CONCURRENCY    = 4
 BOOKLOG_TIMEOUT_MS     = 120_000
 BOOKLOG_RETRY_ATTEMPTS = 5
 BOOKLOG_JITTER         = 0.6
 BOOKLOG_BASE_DELAY     = 0.8
 
+# Писатели
 WRITERS = 8
-WRITE_QUEUE_MAXSIZE = 5000
-BATCH_SIZE  = 100_000
-BATCH_PAUSE = 0.0
+WRITE_QUEUE_MAXSIZE = 10_000
 
 DEFAULT_CM_CODE = "CM1000"
 WORK_ROOT = Path("work_runs")
@@ -55,8 +57,7 @@ WORK_ROOT.mkdir(exist_ok=True)
 OLD_XML_DIR = Path("xml_api")  # из старых запусков — будем чистить
 
 SAFE_CHARS = re.compile(r'[\\/*?:"<>|]+')
-# TEST_ONLY_PMS = 7
-TEST_ONLY_PMS = None
+TEST_ONLY_PMS = None  # например, 7
 
 # ======= доп. фильтр доменов для "все остальные почты" =======
 EXCLUDE_EMAIL_DOMAINS = {
@@ -167,7 +168,6 @@ def parse_booking_info(xml_text: str) -> dict:
     if ph_el is not None:
         phone = (ph_el.attrib.get("PhoneNumber", "") or "").strip()
 
-    # ---- Total ----
     total_amount = ""
     currency = ""
     total_el = root.find(".//ota:Total", ns)
@@ -193,9 +193,6 @@ def parse_booking_info(xml_text: str) -> dict:
 def is_booking_com_xml(xml_text: str) -> bool:
     """
     Возвращает True, если XML относится к Booking.com.
-    Критерии:
-      - Source/BookingChannel/CompanyName[@Code='19'], либо
-      - текст CompanyName содержит 'booking.com'.
     """
     if not xml_text:
         return False
@@ -601,53 +598,56 @@ async def list_hotels_from_dropdown(page) -> List[str]:
     return texts
 
 
-# ---------------- API ----------------
-async def post_json_with_retry(
-    req, url: str, payload: dict, *,
-    attempts: int = RETRY_ATTEMPTS,
-    timeout_ms: int = REQ_TIMEOUT_MS,
-    base_delay: float = RETRY_BASE_DELAY,
-    jitter: float = RETRY_JITTER,
-):
+# ---------------- API via AIOHTTP ----------------
+def _ms_to_seconds(ms: int) -> float:
+    return max(0.1, ms/1000.0)
+
+async def post_json_with_retry_aiohttp(
+    session: aiohttp.ClientSession,
+    url: str,
+    payload: dict, *,
+    attempts: int,
+    timeout_ms: int,
+    base_delay: float,
+    jitter: float,
+) -> Optional[Any]:
     delay = base_delay
     last_err = None
     t0 = time.perf_counter()
-    logger.info(f"[HTTP] POST -> {url} (timeout={timeout_ms}ms, attempts={attempts})")
+    timeout = aiohttp.ClientTimeout(total=_ms_to_seconds(timeout_ms))
 
     for i in range(1, attempts + 1):
-        attempt_start = time.perf_counter()
+        t_try = time.perf_counter()
         try:
-            resp = await req.post(
+            async with session.post(
                 url,
-                data=json.dumps(payload),
+                json=payload,
                 headers={
                     "content-type": "application/json",
                     "origin": URL,
                     "referer": URL + "/",
                     "accept": "application/json, text/plain, */*",
                 },
-                timeout=timeout_ms,
-            )
-            status = resp.status
-            txt = await resp.text()
-            elapsed_attempt = time.perf_counter() - attempt_start
-
-            if 200 <= status < 400:
-                try:
-                    js = await resp.json()
-                except Exception:
+                timeout=timeout
+            ) as resp:
+                status = resp.status
+                txt = await resp.text()
+                if 200 <= status < 400:
                     try:
-                        js = json.loads(txt)
+                        js = await resp.json()
                     except Exception:
-                        js = txt
-                logger.info(f"[HTTP] OK {status} {url} in {elapsed_attempt:.3f}s")
-                log_duration("HTTP total", t0, f"({url})")
-                return js
-            last_err = f"HTTP {status}: {txt[:300]}"
-            logger.warning(f"[HTTP] Fail attempt {i}/{attempts} {url} in {elapsed_attempt:.3f}s: {last_err}")
-        except PWTimeout as te:
+                        try:
+                            js = json.loads(txt)
+                        except Exception:
+                            js = txt
+                    logger.info(f"[HTTP] OK {status} {url} in {(time.perf_counter()-t_try):.3f}s")
+                    log_duration("HTTP total", t0, f"({url})")
+                    return js
+                last_err = f"HTTP {status}: {txt[:300]}"
+                logger.warning(f"[HTTP] Fail attempt {i}/{attempts} {url} in {(time.perf_counter()-t_try):.3f}s: {last_err}")
+        except asyncio.TimeoutError as te:
             last_err = f"Timeout: {te}"
-            logger.warning(f"[HTTP] Timeout attempt {i}/{attempts} {url} in {(time.perf_counter()-attempt_start):.3f}s")
+            logger.warning(f"[HTTP] Timeout attempt {i}/{attempts} {url} in {(time.perf_counter()-t_try):.3f}s")
         except Exception as e:
             last_err = f"Exception: {e}"
             logger.warning(f"[HTTP] Exception attempt {i}/{attempts} {url}: {e}")
@@ -662,7 +662,10 @@ async def post_json_with_retry(
     log_duration("HTTP total", t0, f"(FAILED {url})")
     return None
 
-async def api_is_bookinglog_ctx(req, pmscode: int, from_date: str, to_date: str, cmcode: str) -> List[Dict[str, Any]]:
+async def api_is_bookinglog_aio(
+    session: aiohttp.ClientSession,
+    pmscode: int, from_date: str, to_date: str, cmcode: str
+) -> List[Dict[str, Any]]:
     t0 = time.perf_counter()
     url = f"{API_BASE}/api/Bookinglog/IsBookinglog"
     payload = {
@@ -674,8 +677,8 @@ async def api_is_bookinglog_ctx(req, pmscode: int, from_date: str, to_date: str,
         "PaginationToId": "50",
         "Search": ""
     }
-    js = await post_json_with_retry(
-        req, url, payload,
+    js = await post_json_with_retry_aiohttp(
+        session, url, payload,
         attempts=BOOKLOG_RETRY_ATTEMPTS,
         timeout_ms=BOOKLOG_TIMEOUT_MS,
         base_delay=BOOKLOG_BASE_DELAY,
@@ -687,11 +690,20 @@ async def api_is_bookinglog_ctx(req, pmscode: int, from_date: str, to_date: str,
     log_duration("API BookingLog", t0, f"(pms={pmscode}, rows=0; bad-response)")
     return []
 
-async def api_get_xml_ctx(req, pmscode: int, token: int, cmcode: str, xml_type: str = "ReceivedXML") -> str:
+async def api_get_xml_aio(
+    session: aiohttp.ClientSession,
+    pmscode: int, token: int, cmcode: str, xml_type: str = "ReceivedXML"
+) -> str:
     t0 = time.perf_counter()
     url = f"{API_BASE}/api/AriXml/IsAriBookXml"
     payload = {"pmscode": pmscode, "cmcode": cmcode, "token": token, "Type": xml_type}
-    js = await post_json_with_retry(req, url, payload)
+    js = await post_json_with_retry_aiohttp(
+        session, url, payload,
+        attempts=RETRY_ATTEMPTS,
+        timeout_ms=REQ_TIMEOUT_MS,
+        base_delay=RETRY_BASE_DELAY,
+        jitter=RETRY_JITTER
+    )
     xml = ""
     if isinstance(js, dict):
         xml = js.get("xmlData") or ""
@@ -721,61 +733,73 @@ async def writer_worker(queue: asyncio.Queue):
             path = pms_dir / f"{token}.xml"
             path.write_text(xml_text, encoding="utf-8")
             written += 1
-            if written % 500 == 0:
+            if written % 1000 == 0:
                 logger.info(f"[WRITER] Written so far: {written}")
         except Exception as e:
             logger.warning(f"[WRITER] Failed write token={token} -> {e}")
         finally:
             queue.task_done()
 
-async def _fetch_single_xml_ctx(req, pms: int, token: int, sem_xml: asyncio.Semaphore, write_queue: asyncio.Queue, run_dir: Path) -> bool:
-    async with sem_xml:
+
+async def fetch_single_token(
+    session: aiohttp.ClientSession, pms: int, token: int,
+    sem_token: asyncio.Semaphore, write_queue: asyncio.Queue, run_dir: Path
+) -> bool:
+    async with sem_token:
         try:
-            xml = await api_get_xml_ctx(req, pms, token, DEFAULT_CM_CODE, "ReceivedXML")
+            xml = await api_get_xml_aio(session, pms, token, DEFAULT_CM_CODE, "ReceivedXML")
             if not xml:
                 return False
             pms_dir = run_dir / "xml" / str(pms)
             await write_queue.put((pms_dir, token, xml))
             return True
         except Exception as e:
-            logger.warning(f"[FETCH_XML] _fetch_single_xml_ctx error pms={pms}, token={token}: {e}")
+            logger.warning(f"[FETCH_XML] token={token} pms={pms} -> {e}")
             return False
 
-async def fetch_xml_for_pms_ctx(req, pms: int, sem_xml: asyncio.Semaphore, write_queue: asyncio.Queue,
-                                sem_booklog: asyncio.Semaphore, date_from: str, date_to: str, cm_code: str, run_dir: Path) -> int:
+
+async def process_single_pms(
+    session: aiohttp.ClientSession, pms: int,
+    sem_pms: asyncio.Semaphore, sem_token: asyncio.Semaphore,
+    write_queue: asyncio.Queue, date_from: str, date_to: str,
+    cm_code: str, run_dir: Path
+) -> int:
     t0 = time.perf_counter()
-    try:
-        async with sem_booklog:
-            booking_log = await api_is_bookinglog_ctx(req, pms, date_from, date_to, cm_code)
-        if not booking_log:
-            logger.info(f"[BOOKLOG] pms={pms} -> no rows")
+    async with sem_pms:
+        try:
+            booking_log = await api_is_bookinglog_aio(session, pms, date_from, date_to, cm_code)
+            if not booking_log:
+                logger.info(f"[BOOKLOG] pms={pms} -> no rows")
+                log_duration("FETCH PMS total", t0, f"(pms={pms}, saved=0, tokens=0)")
+                return 0
+
+            tokens: List[int] = []
+            for row in booking_log:
+                token_raw = row.get("echoToken")
+                try:
+                    token = int(float(token_raw))
+                except Exception:
+                    token = 0
+                if token:
+                    tokens.append(token)
+
+            if not tokens:
+                logger.info(f"[BOOKLOG] pms={pms} -> no tokens")
+                log_duration("FETCH PMS total", t0, f"(pms={pms}, saved=0, tokens=0)")
+                return 0
+
+            tasks = [
+                fetch_single_token(session, pms, token, sem_token, write_queue, run_dir)
+                for token in tokens
+            ]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            saved = sum(1 for r in results if isinstance(r, bool) and r)
+            logger.info(f"[BOOKLOG] pms={pms} -> rows={len(booking_log)}; tokens={len(tokens)}; saved={saved}")
+            log_duration("FETCH PMS total", t0, f"(pms={pms}, saved={saved}, tokens={len(tokens)})")
+            return saved
+        except Exception as e:
+            logger.exception(f"[PMS] process_single_pms error pms={pms}: {e}")
             return 0
-
-        tokens = []
-        for row in booking_log:
-            token_raw = row.get("echoToken")
-            try:
-                token = int(float(token_raw))
-            except Exception:
-                token = 0
-            if token:
-                tokens.append(token)
-
-        logger.info(f"[BOOKLOG] pms={pms} -> rows={len(booking_log)}; tokens={len(tokens)}")
-
-        if not tokens:
-            log_duration("FETCH PMS total", t0, f"(pms={pms}, saved=0)")
-            return 0
-
-        tasks = [ _fetch_single_xml_ctx(req, pms, token, sem_xml, write_queue, run_dir) for token in tokens ]
-        result = await asyncio.gather(*tasks, return_exceptions=True)
-        saved = sum(1 for r in result if isinstance(r, bool) and r)
-
-        log_duration("FETCH PMS total", t0, f"(pms={pms}, saved={saved}, tokens={len(tokens)})")
-        return saved
-    except Exception as e:
-        logger.exception(f"[FETCH_XML] fetch_xml_for_pms_ctx error pms={pms}: {e}")
-        return 0
 
 
 # ---------------- TELEGRAM BOT ----------------
@@ -944,42 +968,37 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 await m.answer(f"Тестовый режим: PMS={TEST_ONLY_PMS} не найден среди доступных ({len(pms_to_name)} шт.). Останавливаю.")
                 return
 
-        # 2) Получаем XML и пишем
+        # 2) Получаем XML и пишем (aiohttp + большая параллельность)
         try:
             t0 = time.perf_counter()
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context()
-                req = context.request
-
-                sem_xml = asyncio.Semaphore(CONCURRENCY)
-                sem_booklog = asyncio.Semaphore(BOOKLOG_CONCURRENCY)
+            # Настраиваем сессию aiohttp с большим пулом соединений
+            connector = aiohttp.TCPConnector(limit=600, limit_per_host=0, ttl_dns_cache=300)
+            timeout = aiohttp.ClientTimeout(total=120)  # общий timeout на вызов
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                sem_pms   = asyncio.Semaphore(PMS_CONCURRENCY)
+                sem_token = asyncio.Semaphore(TOKEN_CONCURRENCY)
                 write_queue = asyncio.Queue(maxsize=WRITE_QUEUE_MAXSIZE)
                 writer_tasks = [asyncio.create_task(writer_worker(write_queue)) for _ in range(WRITERS)]
                 logger.info(f"[STEP2] Start fetching XML. PMS total={len(all_pms)}")
 
-                total_saved = 0
-                tasks = [
-                    fetch_xml_for_pms_ctx(req, pms, sem_xml, write_queue, sem_booklog, date_from, date_to, cm_code, run_dir)
+                # Параллельно по PMS
+                pms_tasks = [
+                    process_single_pms(session, pms, sem_pms, sem_token, write_queue, date_from, date_to, cm_code, run_dir)
                     for pms in all_pms
                 ]
 
-                step = 50
-                for i in range(0, len(tasks), step):
-                    t_chunk = time.perf_counter()
-                    chunk = tasks[i:i+step]
-                    res = await asyncio.gather(*chunk)
-                    saved_chunk = sum(res)
-                    total_saved += saved_chunk
-                    log_duration("STEP2: chunk", t_chunk, f"(chunk={i//step+1}, size={len(chunk)}, saved={saved_chunk})")
-                    await m.answer(f"Прогресс: обработано PMS {min(i+step,len(tasks))}/{len(tasks)}, XML сохранено: {total_saved}")
+                total_saved = 0
+                # Ждём в порядке завершения для своевременного прогресса
+                for coro in asyncio.as_completed(pms_tasks):
+                    saved = await coro
+                    total_saved += (saved or 0)
+                    await m.answer(f"🧩 Прогресс PMS: XML сохранено в сумме: {total_saved}")
 
                 # Завершаем писателей
                 for _ in range(WRITERS):
                     await write_queue.put(None)
                 await write_queue.join()
                 await asyncio.gather(*writer_tasks, return_exceptions=True)
-                await browser.close()
             log_duration("STEP 2: Fetch XML total", t0, f"(XML saved={total_saved})")
         except Exception as e:
             await send_error(m, "Загрузка XML", e)
