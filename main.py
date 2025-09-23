@@ -987,12 +987,25 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                     for pms in all_pms
                 ]
 
+                NOTIFY_EVERY = 150  # присылать прогресс раз в 150 PMS
                 total_saved = 0
+                processed = 0
+                total_pms = len(pms_tasks)
                 # Ждём в порядке завершения для своевременного прогресса
                 for coro in asyncio.as_completed(pms_tasks):
                     saved = await coro
                     total_saved += (saved or 0)
-                    await m.answer(f"🧩 Прогресс PMS: XML сохранено в сумме: {total_saved}")
+                    processed += 1
+
+                    if (processed % NOTIFY_EVERY == 0) or (processed == total_pms):
+                        try:
+                            await m.answer(
+                                f"Прогресс: обработано PMS {processed}/{total_pms}, "
+                                f"XML сохранено: {total_saved}"
+                            )
+                        except Exception:
+            # если вдруг Telegram вернул flood, просто пропускаем это сообщение
+                            pass
 
                 # Завершаем писателей
                 for _ in range(WRITERS):
