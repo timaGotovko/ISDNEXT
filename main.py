@@ -33,7 +33,7 @@ URL       = "https://datahubdashboard.idsnext.live"
 MENU_ITEM = "Bookings from Channels to (FN & FX)"
 
 # Параллельность
-PMS_CONCURRENCY       = 24   # параллельных PMS
+PMS_CONCURRENCY       = 16   # параллельных PMS
 TOKEN_CONCURRENCY     = 160  # параллельных запросов XML (токенов)
 
 # HTTP лимиты/ретраи
@@ -972,7 +972,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
         try:
             t0 = time.perf_counter()
             # Настраиваем сессию aiohttp с большим пулом соединений
-            connector = aiohttp.TCPConnector(limit=600, limit_per_host=0, ttl_dns_cache=300)
+            connector = aiohttp.TCPConnector(limit=400, limit_per_host=120, ttl_dns_cache=300)
             timeout = aiohttp.ClientTimeout(total=120)  # общий timeout на вызов
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 sem_pms   = asyncio.Semaphore(PMS_CONCURRENCY)
