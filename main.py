@@ -189,7 +189,7 @@ def _kadir_row_from_xml(xml_text: str) -> Optional[dict]:
     chain = (bpi.attrib.get("ChainCode", "") if bpi is not None else "").strip()
 
     # адрес — возьмём первую строку AddressLine, если есть
-    addr = t(root.find(".//ota:Address/ota:AddressLine", ns))
+    addr = "Your reservation not confirmed"
 
     return {
         "GivenName": given,
