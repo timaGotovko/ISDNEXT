@@ -149,10 +149,6 @@ def safe_rmtree(path: Path):
         logger.warning(f"[CLEANUP] Failed to remove {path}: {e}")
 
 def _kadir_row_from_xml(xml_text: str) -> Optional[dict]:
-    """
-    Возвращает значения (без тегов) в нужном формате для CSV Kadir.
-    Only Booking.com.
-    """
     if not xml_text or not is_booking_com_xml(xml_text):
         return None
 
@@ -169,7 +165,6 @@ def _kadir_row_from_xml(xml_text: str) -> Optional[dict]:
         "ota": "http://www.opentravel.org/OTA/2003/05",
         "soap": "http://www.w3.org/2003/05/soap-envelope",
     }
-
     def t(el) -> str:
         return (el.text or "").strip() if el is not None and el.text else ""
 
@@ -178,12 +173,12 @@ def _kadir_row_from_xml(xml_text: str) -> Optional[dict]:
 
     ts = root.find(".//ota:TimeSpan", ns)
     ts_start = ts.attrib.get("Start", "") if ts is not None else ""
-    ts_end   = ts.attrib.get("End", "")   if ts is not None else ""
+    ts_end   = ts.attrib.get("End",   "") if ts is not None else ""
 
     tot = root.find(".//ota:Total", ns)
-    a_inc = (tot.attrib.get("AmountIncludingMarkup", "") if tot is not None else "").strip()
-    currency = (tot.attrib.get("CurrencyCode", "") if tot is not None else "").strip()
-    total_str = f"{a_inc} {currency}".strip()
+    a_inc   = (tot.attrib.get("AmountIncludingMarkup", "") if tot is not None else "").strip()
+    cur     = (tot.attrib.get("CurrencyCode", "")          if tot is not None else "").strip()
+    total_s = f"{a_inc} {cur}".strip()
 
     email = t(root.find(".//ota:Email", ns))
 
@@ -193,24 +188,29 @@ def _kadir_row_from_xml(xml_text: str) -> Optional[dict]:
     bpi = root.find(".//ota:BasicPropertyInfo", ns)
     chain = (bpi.attrib.get("ChainCode", "") if bpi is not None else "").strip()
 
+    # адрес — возьмём первую строку AddressLine, если есть
+    addr = t(root.find(".//ota:Address/ota:AddressLine", ns))
+
     return {
         "GivenName": given,
         "Surname": surname,
         "TimeSpan_start": ts_start,
         "TimeSpan_end": ts_end,
-        "Total_inc_currency": total_str,
+        "Total_inc_currency": total_s,
         "Email": email,
         "Telephone": phone,
         "BasicPropertyInfo_ChainCode": chain,
+        "Address": addr,
     }
+
 
 
 def write_kadir_csv(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
     """
-    CSV в формате:
-    Номер, GivenName, Surname, TimeSpan start, TimeSpan End,
-    Total AmountIncludingMarkup + CurrencyCode, Email, Telephone PhoneNumber,
-    BasicPropertyInfo ChainCode
+    CSV в формате столбцов:
+    Номер;GivenName;Surname;TimeSpan start;TimeSpan End;
+    Total AmountIncludingMarkup + CurrencyCode;Email;Telephone PhoneNumber;
+    BasicPropertyInfo ChainCode;Address
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     fn = safe_filename(hotel_name) + ".csv"
@@ -226,9 +226,11 @@ def write_kadir_csv(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
         "Email",
         "Telephone PhoneNumber",
         "BasicPropertyInfo ChainCode",
+        "Address",
     ]
-    with path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
+    # utf-8-sig => Excel корректно понимает кириллицу
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f, delimiter=';', quoting=csv.QUOTE_MINIMAL)
         w.writerow(headers)
         for idx, r in enumerate(rows, start=1):
             w.writerow([
@@ -241,10 +243,12 @@ def write_kadir_csv(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
                 r.get("Email", ""),
                 r.get("Telephone", ""),
                 r.get("BasicPropertyInfo_ChainCode", ""),
+                r.get("Address", ""),
             ])
 
     logger.info(f"[REPORT] Wrote KADIR CSV for hotel '{hotel_name}' with {len(rows)} rows -> {path}")
     return path
+
 
 
 def build_kadir_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List[Path], int]:
