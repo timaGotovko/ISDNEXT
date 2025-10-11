@@ -276,6 +276,70 @@ def build_kadir_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[Lis
 
     return out_paths, total_rows
 
+def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List[Path], int]:
+    """
+    Собираем все строки в ОДИН CSV-файл (для режима Kadir).
+    Возвращаем ([путь_к_csv], всего_строк).
+    Требует, чтобы _kadir_row_from_xml возвращал поля:
+    GivenName, Surname, TimeSpan_start, TimeSpan_end, Total_inc_currency,
+    Email, Telephone, BasicPropertyInfo_ChainCode, Address
+    """
+    out_dir = run_dir / "reports"
+    out_dir.mkdir(exist_ok=True, parents=True)
+    out_path = out_dir / "kadir_all.csv"
+
+    headers = [
+        "Номер",
+        "GivenName",
+        "Surname",
+        "TimeSpan start",
+        "TimeSpan End",
+        "Total AmountIncludingMarkup + CurrencyCode",
+        "Email",
+        "Telephone PhoneNumber",
+        "BasicPropertyInfo ChainCode",
+        "Address",
+    ]
+
+    total = 0
+    with out_path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(headers)
+
+        idx = 1
+        save_dir = run_dir / "xml"
+        # идём по PMS в предсказуемом порядке
+        for pms in sorted(pms_to_name.keys()):
+            pms_dir = save_dir / str(pms)
+            if not pms_dir.exists():
+                continue
+            for xml_path in sorted(pms_dir.glob("*.xml")):
+                try:
+                    xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
+                    row = _kadir_row_from_xml(xml_text)
+                    if not row:
+                        continue
+                    w.writerow([
+                        idx,
+                        row.get("GivenName", ""),
+                        row.get("Surname", ""),
+                        row.get("TimeSpan_start", ""),
+                        row.get("TimeSpan_end", ""),
+                        row.get("Total_inc_currency", ""),
+                        row.get("Email", ""),
+                        row.get("Telephone", ""),
+                        row.get("BasicPropertyInfo_ChainCode", ""),
+                        row.get("Address", ""),
+                    ])
+                    idx += 1
+                    total += 1
+                except Exception as e:
+                    logger.warning(f"[KADIR MERGE] Failed on {xml_path}: {e}")
+
+    logger.info(f"[REPORT] Wrote merged KADIR CSV with {total} rows -> {out_path}")
+    return [out_path], total
+
+
 
 
 
@@ -1206,16 +1270,16 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 fmt = (numbers_format or "word").lower()
                 if fmt == "kadir":
                     # CSV с тегами (формат Kadir)
-                    reports, total_rows = build_kadir_reports(pms_to_name, run_dir)
+                    reports, total_rows = build_kadir_merged(pms_to_name, run_dir)
                     if not reports:
                         await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
                         safe_rmtree(run_dir)
                         return
                     await m.answer(
-                        f"Сформировано отчётов: {len(reports)}.\n"
+                        f"Сформирован общий CSV: {len(reports)} файл.\n"
                         f"Всего записей: {total_rows}\nУпаковываю в ZIP..."
                     )   
-                    final_caption = f"Готово! CSV: {len(reports)} | Записей: {total_rows} (формат Kadir)"
+                    final_caption = f"Готово! CSV: 1 | Записей: {total_rows} (формат Kadir)"
                 else:
                     # Word: как раньше (TXT по телефонам)
                     reports, total_rows, _ = build_hotel_reports(pms_to_name, run_dir)
