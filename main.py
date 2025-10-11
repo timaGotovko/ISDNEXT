@@ -302,8 +302,8 @@ def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List
     ]
 
     total = 0
-    with out_path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.writer(f)
+    with out_path.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f, delimiter=';', quoting=csv.QUOTE_MINIMAL)
         w.writerow(headers)
 
         idx = 1
