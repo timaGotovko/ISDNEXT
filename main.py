@@ -20,6 +20,7 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from dotenv import load_dotenv
+import csv
 
 from playwright.async_api import async_playwright
 import aiohttp
@@ -92,6 +93,15 @@ class AuthFlow(StatesGroup):
     waiting_dates      = State()
     waiting_choice     = State()   # номера или почты
     waiting_email_kind = State()   # если почты: booking / other
+    waiting_numbers_fmt = State()
+
+KB_NUMBERS_FMT = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Word")],
+        [KeyboardButton(text="Kadir")]
+    ],
+    resize_keyboard=True
+)
 
 # Кнопки
 KB_PARSE_CHOICE = ReplyKeyboardMarkup(
@@ -137,6 +147,126 @@ def safe_rmtree(path: Path):
             logger.info(f"[CLEANUP] Removed directory: {path}")
     except Exception as e:
         logger.warning(f"[CLEANUP] Failed to remove {path}: {e}")
+
+
+import csv
+
+def _kadir_row_from_xml(xml_text: str) -> Optional[dict]:
+    """
+    Отдаёт словарь со строками-тегами (как в задании), либо None если XML не от Booking.com.
+    """
+    if not xml_text:
+        return None
+    if not is_booking_com_xml(xml_text):
+        return None
+
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        try:
+            xml_text = re.sub(r'^\s*[^<]+<', '<', xml_text, count=1)
+            root = ET.fromstring(xml_text)
+        except Exception:
+            return None
+
+    ns = {
+        "ota": "http://www.opentravel.org/OTA/2003/05",
+        "soap": "http://www.w3.org/2003/05/soap-envelope",
+    }
+
+    def t(el) -> str:
+        return (el.text or "").strip() if el is not None and el.text else ""
+
+    # данные
+    gn = t(root.find(".//ota:GivenName", ns))
+    sn = t(root.find(".//ota:Surname", ns))
+
+    ts = root.find(".//ota:TimeSpan", ns)
+    ts_start = ts.attrib.get("Start", "") if ts is not None else ""
+    ts_end   = ts.attrib.get("End", "")   if ts is not None else ""
+
+    tot = root.find(".//ota:Total", ns)
+    a_inc = tot.attrib.get("AmountIncludingMarkup", "") if tot is not None else ""
+    a_bt  = tot.attrib.get("AmountBeforeTax", "")       if tot is not None else ""
+    cur   = tot.attrib.get("CurrencyCode", "")          if tot is not None else ""
+
+    em_el = root.find(".//ota:Email", ns)
+    email = t(em_el)
+
+    tel = root.find(".//ota:Telephone", ns)
+    tel_num = tel.attrib.get("PhoneNumber", "") if tel is not None else ""
+    tel_type = tel.attrib.get("PhoneTechType", "") if tel is not None else ""
+
+    bpi = root.find(".//ota:BasicPropertyInfo", ns)
+    chain = bpi.attrib.get("ChainCode", "") if bpi is not None else ""
+    hcode = bpi.attrib.get("HotelCode", "") if bpi is not None else ""
+
+    # формируем строки-теги
+    s_given   = f"<GivenName>{gn}</GivenName>"
+    s_surname = f"<Surname>{sn}</Surname>"
+    s_timespan = f'<TimeSpan Start="{ts_start}" End="{ts_end}" />'
+    s_total    = f'<Total AmountIncludingMarkup="{a_inc}" AmountBeforeTax="{a_bt}" CurrencyCode="{cur}" />'
+    s_email    = f"<Email>{email}</Email>"
+    s_tel      = f'<Telephone PhoneNumber="{tel_num}" PhoneTechType="{tel_type}" />'
+    s_basic    = f'<BasicPropertyInfo ChainCode="{chain}" HotelCode="{hcode}" />'
+
+    return {
+        "GivenName": s_given,
+        "Surname": s_surname,
+        "TimeSpan": s_timespan,
+        "Total": s_total,
+        "Email": s_email,
+        "Telephone": s_tel,
+        "BasicPropertyInfo": s_basic,
+    }
+
+def write_kadir_csv(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
+    """
+    CSV: GivenName,Surname,TimeSpan,Total,Email,Telephone,BasicPropertyInfo
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fn = safe_filename(hotel_name) + ".csv"
+    path = out_dir / fn
+    fields = ["GivenName","Surname","TimeSpan","Total","Email","Telephone","BasicPropertyInfo"]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields, quoting=csv.QUOTE_MINIMAL)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k,"") for k in fields})
+    logger.info(f"[REPORT] Wrote KADIR CSV for hotel '{hotel_name}' with {len(rows)} rows -> {path}")
+    return path
+
+def build_kadir_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List[Path], int]:
+    """
+    Booking-only. Формирует CSV в формате Kadir.
+    Возвращает: (список путей, всего строк)
+    """
+    out_paths = []
+    total_rows = 0
+    save_dir = run_dir / "xml"
+    out_dir  = run_dir / "reports"
+    out_dir.mkdir(exist_ok=True, parents=True)
+
+    for pms, hotel_name in pms_to_name.items():
+        pms_dir = save_dir / str(pms)
+        if not pms_dir.exists():
+            continue
+        rows = []
+        for xml_path in sorted(pms_dir.glob("*.xml")):
+            try:
+                xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
+                row = _kadir_row_from_xml(xml_text)
+                if row:
+                    rows.append(row)
+            except Exception:
+                pass
+        if rows:
+            total_rows += len(rows)
+            out_paths.append(write_kadir_csv(hotel_name, rows, out_dir))
+
+    return out_paths, total_rows
+
+
 
 
 # ========= ПАРСИНГ XML =========
@@ -890,16 +1020,30 @@ async def select_numbers_or_emails(m: Message, state: FSMContext):
     text = (m.text or "").strip().lower()
     if "номера" in text:
         await state.update_data(parse_mode="numbers")
-        await m.answer("Ок, парсим только номера.", reply_markup=ReplyKeyboardRemove())
-        data = await state.get_data()
-        await start_job_from_state(m, data, parse_mode="numbers")
-        await state.clear()
+        await m.answer("Выбери формат выгрузки номеров:", reply_markup=KB_NUMBERS_FMT)
+        await state.set_state(AuthFlow.waiting_numbers_fmt)   # <-- идём выбирать формат
     elif "почт" in text:
         await state.update_data(parse_mode="emails")
         await m.answer("Выбери тип почт:", reply_markup=KB_EMAIL_KIND)
         await state.set_state(AuthFlow.waiting_email_kind)
     else:
         await m.answer("Нажми одну из кнопок ниже.", reply_markup=KB_PARSE_CHOICE)
+
+@dp.message(AuthFlow.waiting_numbers_fmt)
+async def select_numbers_fmt(m: Message, state: FSMContext):
+    t = (m.text or "").strip().lower()
+    if t == "word":
+        await state.update_data(numbers_format="word")
+    elif t == "kadir":
+        await state.update_data(numbers_format="kadir")
+    else:
+        await m.answer("Выбери формат: Word или Kadir", reply_markup=KB_NUMBERS_FMT)
+        return
+
+    await m.answer("Ок, запускаю парсинг.", reply_markup=ReplyKeyboardRemove())
+    data = await state.get_data()
+    await start_job_from_state(m, data, parse_mode="numbers")
+    await state.clear()
 
 @dp.message(AuthFlow.waiting_email_kind)
 async def select_email_kind(m: Message, state: FSMContext):
@@ -930,11 +1074,12 @@ async def start_job_from_state(m: Message, data: dict, parse_mode: str):
     run_dir.mkdir(exist_ok=True, parents=True)
     logger.info(f"[RUN] Start job run_dir={run_dir} mode={parse_mode} email_kind={email_kind}")
 
+    numbers_format = data.get("numbers_format", "word")
     asyncio.create_task(
         run_job_and_reply(
             m, username, password, date_from, date_to,
             DEFAULT_CM_CODE, run_dir,
-            parse_mode=parse_mode, email_kind=email_kind
+            parse_mode=parse_mode, email_kind=email_kind, numbers_format=numbers_format
         )
     )
     await m.answer("Запустил парсинг. Это займёт некоторое время. Буду присылать прогресс.")
@@ -942,7 +1087,7 @@ async def start_job_from_state(m: Message, data: dict, parse_mode: str):
 
 async def run_job_and_reply(m: Message, username: str, password: str, date_from: str, date_to: str,
                             cm_code: str, run_dir: Path, parse_mode: str = "numbers",
-                            email_kind: Optional[str] = None):
+                            email_kind: Optional[str] = None, numbers_format: str = "word"):
     t_all = time.perf_counter()
     try:
         # 1) Получаем PMS->Name
@@ -1047,7 +1192,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
         # 3) TXT-отчёты + подсчёты
         try:
             t0 = time.perf_counter()
-            if parse_mode == "numbers":
+            if parse_mode == "numbers": 
                 reports, total_rows, _ = build_hotel_reports(pms_to_name, run_dir)
                 if not reports:
                     await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
