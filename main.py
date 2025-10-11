@@ -58,7 +58,7 @@ WORK_ROOT.mkdir(exist_ok=True)
 OLD_XML_DIR = Path("xml_api")  # из старых запусков — будем чистить
 
 SAFE_CHARS = re.compile(r'[\\/*?:"<>|]+')
-TEST_ONLY_PMS = None  # например, 7
+TEST_ONLY_PMS = 7  # например, 7
 
 # ======= доп. фильтр доменов для "все остальные почты" =======
 EXCLUDE_EMAIL_DOMAINS = {
