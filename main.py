@@ -148,9 +148,6 @@ def safe_rmtree(path: Path):
     except Exception as e:
         logger.warning(f"[CLEANUP] Failed to remove {path}: {e}")
 
-
-import csv
-
 def _kadir_row_from_xml(xml_text: str) -> Optional[dict]:
     """
     Отдаёт словарь со строками-тегами (как в задании), либо None если XML не от Booking.com.
@@ -1174,7 +1171,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                                 f"XML сохранено: {total_saved}"
                             )
                         except Exception:
-            # если вдруг Telegram вернул flood, просто пропускаем это сообщение
+                            # если вдруг Telegram вернул flood, просто пропускаем это сообщение
                             pass
 
                 # Завершаем писателей
@@ -1193,13 +1190,31 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
         try:
             t0 = time.perf_counter()
             if parse_mode == "numbers": 
-                reports, total_rows, _ = build_hotel_reports(pms_to_name, run_dir)
-                if not reports:
-                    await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
-                    safe_rmtree(run_dir)
-                    return
-                await m.answer(f"Сформировано отчётов: {len(reports)}.\nВсего номеров: {total_rows}\nУпаковываю в ZIP...")
-                final_caption = f"Готово! TXT: {len(reports)} | Номеров: {total_rows}"
+                fmt = (numbers_format or "word").lower()
+                if fmt == "kadir":
+                    # CSV с тегами (формат Kadir)
+                    reports, total_rows = build_kadir_reports(pms_to_name, run_dir)
+                    if not reports:
+                        await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
+                        safe_rmtree(run_dir)
+                        return
+                    await m.answer(
+                        f"Сформировано отчётов: {len(reports)}.\n"
+                        f"Всего записей: {total_rows}\nУпаковываю в ZIP..."
+                    )   
+                    final_caption = f"Готово! CSV: {len(reports)} | Записей: {total_rows} (формат Kadir)"
+                else:
+                    # Word: как раньше (TXT по телефонам)
+                    reports, total_rows, _ = build_hotel_reports(pms_to_name, run_dir)
+                    if not reports:
+                        await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
+                        safe_rmtree(run_dir)
+                        return
+                    await m.answer(
+                        f"Сформировано отчётов: {len(reports)}.\n"
+                        f"Всего номеров: {total_rows}\nУпаковываю в ZIP..."
+                    )
+                    final_caption = f"Готово! TXT: {len(reports)} | Номеров: {total_rows}"
             else:
                 reports, total_emails = build_email_reports(pms_to_name, run_dir, email_kind=email_kind or "other")
                 if not reports:
