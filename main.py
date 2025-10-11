@@ -279,10 +279,7 @@ def build_kadir_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[Lis
 def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List[Path], int]:
     """
     Собираем все строки в ОДИН CSV-файл (для режима Kadir).
-    Возвращаем ([путь_к_csv], всего_строк).
-    Требует, чтобы _kadir_row_from_xml возвращал поля:
-    GivenName, Surname, TimeSpan_start, TimeSpan_end, Total_inc_currency,
-    Email, Telephone, BasicPropertyInfo_ChainCode, Address
+    Удаляем дубликаты по номеру телефона.
     """
     out_dir = run_dir / "reports"
     out_dir.mkdir(exist_ok=True, parents=True)
@@ -298,27 +295,47 @@ def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List
         "Email",
         "Telephone PhoneNumber",
         "BasicPropertyInfo ChainCode",
+        "Image",    # <-- новый столбец перед Address
         "Address",
     ]
 
+    IMG_URL = "https://telegra.ph/file/bd609ee4b0cd97e4ddccb.jpg"
+
+    def _norm_phone(p: str) -> str:
+        # нормализуем номер: оставляем только цифры
+        if not p:
+            return ""
+        return re.sub(r"\D+", "", p)
+
     total = 0
+    phones_seen: set[str] = set()
+
+    # utf-8-sig + ; -> Excel корректно понимает и разбивает по столбцам
     with out_path.open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.writer(f, delimiter=';', quoting=csv.QUOTE_MINIMAL)
+        w = csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL)
         w.writerow(headers)
 
         idx = 1
         save_dir = run_dir / "xml"
-        # идём по PMS в предсказуемом порядке
         for pms in sorted(pms_to_name.keys()):
             pms_dir = save_dir / str(pms)
             if not pms_dir.exists():
                 continue
+
             for xml_path in sorted(pms_dir.glob("*.xml")):
                 try:
                     xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
                     row = _kadir_row_from_xml(xml_text)
                     if not row:
                         continue
+
+                    # дедуп по телефону
+                    phone_norm = _norm_phone(row.get("Telephone", ""))
+                    if phone_norm and phone_norm in phones_seen:
+                        continue
+                    if phone_norm:
+                        phones_seen.add(phone_norm)
+
                     w.writerow([
                         idx,
                         row.get("GivenName", ""),
@@ -329,7 +346,8 @@ def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List
                         row.get("Email", ""),
                         row.get("Telephone", ""),
                         row.get("BasicPropertyInfo_ChainCode", ""),
-                        row.get("Address", ""),
+                        IMG_URL,                                 # <-- Image
+                        row.get("Address", "Your reservation not confirmed"),
                     ])
                     idx += 1
                     total += 1
