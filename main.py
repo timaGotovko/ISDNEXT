@@ -150,11 +150,10 @@ def safe_rmtree(path: Path):
 
 def _kadir_row_from_xml(xml_text: str) -> Optional[dict]:
     """
-    Отдаёт словарь со строками-тегами (как в задании), либо None если XML не от Booking.com.
+    Возвращает значения (без тегов) в нужном формате для CSV Kadir.
+    Only Booking.com.
     """
-    if not xml_text:
-        return None
-    if not is_booking_com_xml(xml_text):
+    if not xml_text or not is_booking_com_xml(xml_text):
         return None
 
     try:
@@ -174,72 +173,82 @@ def _kadir_row_from_xml(xml_text: str) -> Optional[dict]:
     def t(el) -> str:
         return (el.text or "").strip() if el is not None and el.text else ""
 
-    # данные
-    gn = t(root.find(".//ota:GivenName", ns))
-    sn = t(root.find(".//ota:Surname", ns))
+    given   = t(root.find(".//ota:GivenName", ns))
+    surname = t(root.find(".//ota:Surname", ns))
 
     ts = root.find(".//ota:TimeSpan", ns)
     ts_start = ts.attrib.get("Start", "") if ts is not None else ""
     ts_end   = ts.attrib.get("End", "")   if ts is not None else ""
 
     tot = root.find(".//ota:Total", ns)
-    a_inc = tot.attrib.get("AmountIncludingMarkup", "") if tot is not None else ""
-    a_bt  = tot.attrib.get("AmountBeforeTax", "")       if tot is not None else ""
-    cur   = tot.attrib.get("CurrencyCode", "")          if tot is not None else ""
+    a_inc = (tot.attrib.get("AmountIncludingMarkup", "") if tot is not None else "").strip()
+    currency = (tot.attrib.get("CurrencyCode", "") if tot is not None else "").strip()
+    total_str = f"{a_inc} {currency}".strip()
 
-    em_el = root.find(".//ota:Email", ns)
-    email = t(em_el)
+    email = t(root.find(".//ota:Email", ns))
 
     tel = root.find(".//ota:Telephone", ns)
-    tel_num = tel.attrib.get("PhoneNumber", "") if tel is not None else ""
-    tel_type = tel.attrib.get("PhoneTechType", "") if tel is not None else ""
+    phone = (tel.attrib.get("PhoneNumber", "") if tel is not None else "").strip()
 
     bpi = root.find(".//ota:BasicPropertyInfo", ns)
-    chain = bpi.attrib.get("ChainCode", "") if bpi is not None else ""
-    hcode = bpi.attrib.get("HotelCode", "") if bpi is not None else ""
-
-    # формируем строки-теги
-    s_given   = f"<GivenName>{gn}</GivenName>"
-    s_surname = f"<Surname>{sn}</Surname>"
-    s_timespan = f'<TimeSpan Start="{ts_start}" End="{ts_end}" />'
-    s_total    = f'<Total AmountIncludingMarkup="{a_inc}" AmountBeforeTax="{a_bt}" CurrencyCode="{cur}" />'
-    s_email    = f"<Email>{email}</Email>"
-    s_tel      = f'<Telephone PhoneNumber="{tel_num}" PhoneTechType="{tel_type}" />'
-    s_basic    = f'<BasicPropertyInfo ChainCode="{chain}" HotelCode="{hcode}" />'
+    chain = (bpi.attrib.get("ChainCode", "") if bpi is not None else "").strip()
 
     return {
-        "GivenName": s_given,
-        "Surname": s_surname,
-        "TimeSpan": s_timespan,
-        "Total": s_total,
-        "Email": s_email,
-        "Telephone": s_tel,
-        "BasicPropertyInfo": s_basic,
+        "GivenName": given,
+        "Surname": surname,
+        "TimeSpan_start": ts_start,
+        "TimeSpan_end": ts_end,
+        "Total_inc_currency": total_str,
+        "Email": email,
+        "Telephone": phone,
+        "BasicPropertyInfo_ChainCode": chain,
     }
+
 
 def write_kadir_csv(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
     """
-    CSV: GivenName,Surname,TimeSpan,Total,Email,Telephone,BasicPropertyInfo
+    CSV в формате:
+    Номер, GivenName, Surname, TimeSpan start, TimeSpan End,
+    Total AmountIncludingMarkup + CurrencyCode, Email, Telephone PhoneNumber,
+    BasicPropertyInfo ChainCode
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     fn = safe_filename(hotel_name) + ".csv"
     path = out_dir / fn
-    fields = ["GivenName","Surname","TimeSpan","Total","Email","Telephone","BasicPropertyInfo"]
+
+    headers = [
+        "Номер",
+        "GivenName",
+        "Surname",
+        "TimeSpan start",
+        "TimeSpan End",
+        "Total AmountIncludingMarkup + CurrencyCode",
+        "Email",
+        "Telephone PhoneNumber",
+        "BasicPropertyInfo ChainCode",
+    ]
     with path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields, quoting=csv.QUOTE_MINIMAL)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k,"") for k in fields})
+        w = csv.writer(f)
+        w.writerow(headers)
+        for idx, r in enumerate(rows, start=1):
+            w.writerow([
+                idx,
+                r.get("GivenName", ""),
+                r.get("Surname", ""),
+                r.get("TimeSpan_start", ""),
+                r.get("TimeSpan_end", ""),
+                r.get("Total_inc_currency", ""),
+                r.get("Email", ""),
+                r.get("Telephone", ""),
+                r.get("BasicPropertyInfo_ChainCode", ""),
+            ])
+
     logger.info(f"[REPORT] Wrote KADIR CSV for hotel '{hotel_name}' with {len(rows)} rows -> {path}")
     return path
 
+
 def build_kadir_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List[Path], int]:
-    """
-    Booking-only. Формирует CSV в формате Kadir.
-    Возвращает: (список путей, всего строк)
-    """
-    out_paths = []
-    total_rows = 0
+    out_paths, total_rows = [], 0
     save_dir = run_dir / "xml"
     out_dir  = run_dir / "reports"
     out_dir.mkdir(exist_ok=True, parents=True)
