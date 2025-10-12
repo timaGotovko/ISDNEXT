@@ -58,7 +58,7 @@ WORK_ROOT.mkdir(exist_ok=True)
 OLD_XML_DIR = Path("xml_api")  # из старых запусков — будем чистить
 
 SAFE_CHARS = re.compile(r'[\\/*?:"<>|]+')
-TEST_ONLY_PMS = None  # например, 7
+TEST_ONLY_PMS = 7  # например, 7
 
 # ======= доп. фильтр доменов для "все остальные почты" =======
 EXCLUDE_EMAIL_DOMAINS = {
@@ -94,11 +94,14 @@ class AuthFlow(StatesGroup):
     waiting_choice     = State()   # номера или почты
     waiting_email_kind = State()   # если почты: booking / other
     waiting_numbers_fmt = State()
+    waiting_user_id = State()
+    waiting_domain_id = State()
 
 KB_NUMBERS_FMT = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Word")],
-        [KeyboardButton(text="Kadir")]
+        [KeyboardButton(text="Kadir")],
+        [KeyboardButton(text="Kadir 2")] 
     ],
     resize_keyboard=True
 )
@@ -1126,16 +1129,28 @@ async def select_numbers_fmt(m: Message, state: FSMContext):
     t = (m.text or "").strip().lower()
     if t == "word":
         await state.update_data(numbers_format="word")
-    elif t == "kadir":
-        await state.update_data(numbers_format="kadir")
-    else:
-        await m.answer("Выбери формат: Word или Kadir", reply_markup=KB_NUMBERS_FMT)
+        await m.answer("Ок, запускаю парсинг.", reply_markup=ReplyKeyboardRemove())
+        data = await state.get_data()
+        await start_job_from_state(m, data, parse_mode="numbers")
+        await state.clear()
         return
 
-    await m.answer("Ок, запускаю парсинг.", reply_markup=ReplyKeyboardRemove())
-    data = await state.get_data()
-    await start_job_from_state(m, data, parse_mode="numbers")
-    await state.clear()
+    if t == "kadir":
+        await state.update_data(numbers_format="kadir")
+        await m.answer("Ок, запускаю парсинг.", reply_markup=ReplyKeyboardRemove())
+        data = await state.get_data()
+        await start_job_from_state(m, data, parse_mode="numbers")
+        await state.clear()
+        return
+
+    if t == "kadir 2":
+        await state.update_data(numbers_format="kadir2")     # NEW
+        await m.answer("Введи user_id:", reply_markup=ReplyKeyboardRemove())
+        await state.set_state(AuthFlow.waiting_user_id)
+        return
+
+    await m.answer("Выбери формат: Word / Kadir / Kadir 2", reply_markup=KB_NUMBERS_FMT)
+
 
 @dp.message(AuthFlow.waiting_email_kind)
 async def select_email_kind(m: Message, state: FSMContext):
@@ -1153,6 +1168,22 @@ async def select_email_kind(m: Message, state: FSMContext):
     await start_job_from_state(m, data, parse_mode="emails")
     await state.clear()
 
+@dp.message(AuthFlow.waiting_user_id)
+async def get_user_id(m: Message, state: FSMContext):
+    await state.update_data(user_id=(m.text or "").strip())
+    await m.answer("Теперь введи domain_id:")
+    await state.set_state(AuthFlow.waiting_domain_id)
+
+@dp.message(AuthFlow.waiting_domain_id)
+async def get_domain_id(m: Message, state: FSMContext):
+    await state.update_data(domain_id=(m.text or "").strip())
+
+    await m.answer("Ок, запускаю парсинг.", reply_markup=ReplyKeyboardRemove())
+    data = await state.get_data()
+    await start_job_from_state(m, data, parse_mode="numbers")
+    await state.clear()
+
+
 async def start_job_from_state(m: Message, data: dict, parse_mode: str):
     username  = data["username"]
     password  = data["password"]
@@ -1167,19 +1198,110 @@ async def start_job_from_state(m: Message, data: dict, parse_mode: str):
     logger.info(f"[RUN] Start job run_dir={run_dir} mode={parse_mode} email_kind={email_kind}")
 
     numbers_format = data.get("numbers_format", "word")
+    user_id = data.get("user_id") 
+    domain_id = data.get("domain_id")     
     asyncio.create_task(
         run_job_and_reply(
             m, username, password, date_from, date_to,
             DEFAULT_CM_CODE, run_dir,
-            parse_mode=parse_mode, email_kind=email_kind, numbers_format=numbers_format
+            parse_mode=parse_mode, email_kind=email_kind, numbers_format=numbers_format,
+            user_id=user_id, domain_id=domain_id   
         )
     )
     await m.answer("Запустил парсинг. Это займёт некоторое время. Буду присылать прогресс.")
 
+def build_kadir_merged_v2(
+    pms_to_name: dict[int, str], run_dir: Path,
+    user_id: str, domain_id: str
+) -> Tuple[List[Path], int]:
+    """
+    Мержим всё в один CSV (как Kadir), но добавляем столбцы:
+    Image, Address, user_id, domain_id, room_name, guests_count.
+    Дубликаты по телефону удаляются.
+    """
+    out_dir = run_dir / "reports"
+    out_dir.mkdir(exist_ok=True, parents=True)
+    out_path = out_dir / "kadir2_all.csv"
+
+    headers = [
+        "Номер",
+        "GivenName",
+        "Surname",
+        "TimeSpan start",
+        "TimeSpan End",
+        "Total AmountIncludingMarkup + CurrencyCode",
+        "Email",
+        "Telephone PhoneNumber",
+        "BasicPropertyInfo ChainCode",
+        "Image",
+        "Address",
+        "user_id",
+        "domain_id",
+        "room_name",
+        "guests_count",
+    ]
+
+    IMG_URL = "https://telegra.ph/file/bd609ee4b0cd97e4ddccb.jpg"
+
+    def _norm_phone(p: str) -> str:
+        return re.sub(r"\D+", "", p or "")
+
+    total = 0
+    phones_seen: set[str] = set()
+
+    with out_path.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL)
+        w.writerow(headers)
+
+        idx = 1
+        save_dir = run_dir / "xml"
+        for pms in sorted(pms_to_name.keys()):
+            pms_dir = save_dir / str(pms)
+            if not pms_dir.exists():
+                continue
+            for xml_path in sorted(pms_dir.glob("*.xml")):
+                try:
+                    xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
+                    row = _kadir_row_from_xml(xml_text)
+                    if not row:
+                        continue
+
+                    phone_norm = _norm_phone(row.get("Telephone", ""))
+                    if phone_norm and phone_norm in phones_seen:
+                        continue
+                    if phone_norm:
+                        phones_seen.add(phone_norm)
+
+                    w.writerow([
+                        idx,
+                        row.get("GivenName", ""),
+                        row.get("Surname", ""),
+                        row.get("TimeSpan_start", ""),
+                        row.get("TimeSpan_end", ""),
+                        row.get("Total_inc_currency", ""),
+                        row.get("Email", ""),
+                        row.get("Telephone", ""),
+                        row.get("BasicPropertyInfo_ChainCode", ""),
+                        IMG_URL,                                              # Image
+                        row.get("Address", "Your reservation not confirmed"),# Address
+                        user_id,
+                        domain_id,
+                        "",       # room_name
+                        "",       # guests_count
+                    ])
+                    idx += 1
+                    total += 1
+                except Exception as e:
+                    logger.warning(f"[KADIR2 MERGE] Failed on {xml_path}: {e}")
+
+    logger.info(f"[REPORT] Wrote merged KADIR2 CSV with {total} rows -> {out_path}")
+    return [out_path], total
+
+
 
 async def run_job_and_reply(m: Message, username: str, password: str, date_from: str, date_to: str,
                             cm_code: str, run_dir: Path, parse_mode: str = "numbers",
-                            email_kind: Optional[str] = None, numbers_format: str = "word"):
+                            email_kind: Optional[str] = None, numbers_format: str = "word", user_id: Optional[str] = None, domain_id: Optional[str] = None):
     t_all = time.perf_counter()
     try:
         # 1) Получаем PMS->Name
@@ -1298,6 +1420,19 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                         f"Всего записей: {total_rows}\nУпаковываю в ZIP..."
                     )   
                     final_caption = f"Готово! CSV: 1 | Записей: {total_rows} (формат Kadir)"
+                elif fmt == "kadir2":                                             # NEW
+                    reports, total_rows = build_kadir_merged_v2(
+                        pms_to_name, run_dir, user_id or "", domain_id or ""
+                    )
+                    if not reports:
+                        await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
+                        safe_rmtree(run_dir)
+                        return
+                    await m.answer(
+                        f"Сформирован общий CSV (Kadir 2): {len(reports)} файл.\n"
+                        f"Всего записей: {total_rows}\nУпаковываю в ZIP..."
+                    )
+                    final_caption = f"Готово! CSV: 1 | Записей: {total_rows} (формат Kadir 2)"
                 else:
                     # Word: как раньше (TXT по телефонам)
                     reports, total_rows, _ = build_hotel_reports(pms_to_name, run_dir)
