@@ -58,7 +58,7 @@ WORK_ROOT.mkdir(exist_ok=True)
 OLD_XML_DIR = Path("xml_api")  # из старых запусков — будем чистить
 
 SAFE_CHARS = re.compile(r'[\\/*?:"<>|]+')
-TEST_ONLY_PMS = None  # например, 7
+TEST_ONLY_PMS = 7  # например, 7
 
 # ======= доп. фильтр доменов для "все остальные почты" =======
 EXCLUDE_EMAIL_DOMAINS = {
@@ -280,40 +280,32 @@ def build_kadir_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[Lis
     return out_paths, total_rows
 
 def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List[Path], int]:
-    """
-    Собираем все строки в ОДИН CSV-файл (для режима Kadir).
-    Удаляем дубликаты по номеру телефона.
-    """
     out_dir = run_dir / "reports"
     out_dir.mkdir(exist_ok=True, parents=True)
     out_path = out_dir / "kadir_all.csv"
 
+    # ЗАГОЛОВКИ: GivenName и Surname -> один столбец GivenName (ФИО)
     headers = [
         "Номер",
-        "GivenName",
-        "Surname",
+        "GivenName",                                # ТУТ будет GivenName + Surname
         "TimeSpan start",
         "TimeSpan End",
         "Total AmountIncludingMarkup + CurrencyCode",
         "Email",
         "Telephone PhoneNumber",
         "BasicPropertyInfo ChainCode",
-        "Image",    # <-- новый столбец перед Address
+        "Image",
         "Address",
     ]
 
     IMG_URL = "https://telegra.ph/file/bd609ee4b0cd97e4ddccb.jpg"
 
     def _norm_phone(p: str) -> str:
-        # нормализуем номер: оставляем только цифры
-        if not p:
-            return ""
-        return re.sub(r"\D+", "", p)
+        return re.sub(r"\D+", "", p or "")
 
     total = 0
     phones_seen: set[str] = set()
 
-    # utf-8-sig + ; -> Excel корректно понимает и разбивает по столбцам
     with out_path.open("w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL)
         w.writerow(headers)
@@ -324,7 +316,6 @@ def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List
             pms_dir = save_dir / str(pms)
             if not pms_dir.exists():
                 continue
-
             for xml_path in sorted(pms_dir.glob("*.xml")):
                 try:
                     xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
@@ -339,17 +330,18 @@ def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List
                     if phone_norm:
                         phones_seen.add(phone_norm)
 
+                    full_name = f"{row.get('GivenName','')} {row.get('Surname','')}".strip()
+
                     w.writerow([
                         idx,
-                        row.get("GivenName", ""),
-                        row.get("Surname", ""),
+                        full_name,                                      # << вместо двух колонок
                         row.get("TimeSpan_start", ""),
                         row.get("TimeSpan_end", ""),
                         row.get("Total_inc_currency", ""),
                         row.get("Email", ""),
                         row.get("Telephone", ""),
                         row.get("BasicPropertyInfo_ChainCode", ""),
-                        IMG_URL,                                 # <-- Image
+                        IMG_URL,
                         row.get("Address", "Your reservation not confirmed"),
                     ])
                     idx += 1
@@ -359,6 +351,7 @@ def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List
 
     logger.info(f"[REPORT] Wrote merged KADIR CSV with {total} rows -> {out_path}")
     return [out_path], total
+
 
 
 
@@ -1214,19 +1207,14 @@ def build_kadir_merged_v2(
     pms_to_name: dict[int, str], run_dir: Path,
     user_id: str, domain_id: str
 ) -> Tuple[List[Path], int]:
-    """
-    Мержим всё в один CSV (как Kadir), но добавляем столбцы:
-    Image, Address, user_id, domain_id, room_name, guests_count.
-    Дубликаты по телефону удаляются.
-    """
     out_dir = run_dir / "reports"
     out_dir.mkdir(exist_ok=True, parents=True)
     out_path = out_dir / "kadir2_all.csv"
 
+    # ЗАГОЛОВКИ: один столбец GivenName (ФИО)
     headers = [
         "Номер",
         "GivenName",
-        "Surname",
         "TimeSpan start",
         "TimeSpan End",
         "Total AmountIncludingMarkup + CurrencyCode",
@@ -1272,22 +1260,23 @@ def build_kadir_merged_v2(
                     if phone_norm:
                         phones_seen.add(phone_norm)
 
+                    full_name = f"{row.get('GivenName','')} {row.get('Surname','')}".strip()
+
                     w.writerow([
                         idx,
-                        row.get("GivenName", ""),
-                        row.get("Surname", ""),
+                        full_name,                                      # << один столбец
                         row.get("TimeSpan_start", ""),
                         row.get("TimeSpan_end", ""),
                         row.get("Total_inc_currency", ""),
                         row.get("Email", ""),
                         row.get("Telephone", ""),
                         row.get("BasicPropertyInfo_ChainCode", ""),
-                        IMG_URL,                                              # Image
-                        row.get("Address", "Your reservation not confirmed"),# Address
+                        IMG_URL,
+                        row.get("Address", "Your reservation not confirmed"),
                         user_id,
                         domain_id,
-                        "",       # room_name
-                        "",       # guests_count
+                        "",    # room_name
+                        "",    # guests_count
                     ])
                     idx += 1
                     total += 1
@@ -1296,6 +1285,7 @@ def build_kadir_merged_v2(
 
     logger.info(f"[REPORT] Wrote merged KADIR2 CSV with {total} rows -> {out_path}")
     return [out_path], total
+
 
 
 
