@@ -474,16 +474,23 @@ def write_hotel_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
     logger.info(f"[REPORT] Wrote numbers TXT for hotel '{hotel_name}' with {len(rows)} rows -> {path}")
     return path
 
-def write_hotel_emails_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
+import csv
+
+def write_hotel_emails_csv(hotel_name: str, rows: list[dict], out_dir: Path) -> Path:
     """
-    TXT для почт: Hotel|Arrival|Departure|Name|Email|Phone|TotalAmount Currency
-    Формат полностью как в отчёте по телефонам, только добавлен Email.
+    CSV для почт: Hotel;Arrival;Departure;Name;Email;Phone;Price
+    где Price = 'Amount + Currency'
     """
     out_dir.mkdir(parents=True, exist_ok=True)
-    fn = safe_filename(hotel_name) + ".txt"
+    fn = safe_filename(hotel_name) + ".csv"
     path = out_dir / fn
 
-    with path.open("w", encoding="utf-8", newline="") as f:
+    headers = ["Hotel", "Arrival", "Departure", "Name", "Email", "Phone", "Price"]
+
+    with path.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL)
+        w.writerow(headers)
+
         for r in rows:
             arrival  = (r.get("start") or "").strip()
             depart   = (r.get("end") or "").strip()
@@ -492,16 +499,13 @@ def write_hotel_emails_txt(hotel_name: str, rows: list[dict], out_dir: Path) -> 
             phone    = (r.get("phone") or "").strip()
             amount   = (r.get("total") or "").strip()
             curr     = (r.get("currency") or "").strip()
+            price    = (amount + (" " + curr if curr else "")).strip()
 
-            # цена в том же виде, что и в write_hotel_txt
-            price = (amount + (" " + curr if curr else "")).strip()
+            w.writerow([hotel_name, arrival, depart, name, email, phone, price])
 
-            # окончательная строка
-            line = f"{hotel_name}|{arrival}|{depart}|{name}|{email}|{phone}|{price}"
-            f.write(line + "\n")
-
-    logger.info(f"[REPORT] Wrote emails TXT for hotel '{hotel_name}' with {len(rows)} rows -> {path}")
+    logger.info(f"[REPORT] Wrote emails CSV for hotel '{hotel_name}' with {len(rows)} rows -> {path}")
     return path
+
 
 
 
@@ -590,7 +594,7 @@ def build_email_reports(pms_to_name: dict[int, str], run_dir: Path, email_kind: 
 
         if rows:
             total_emails += len(rows)
-            out = write_hotel_emails_txt(hotel_name, rows, report_dir)
+            out = write_hotel_emails_csv(hotel_name, rows, report_dir)
             out_paths.append(out)
         log_duration("BUILD_EMAILS per PMS", t1, f"(PMS={pms}, files={count_xml}, rows_kept={kept})")
 
