@@ -298,7 +298,7 @@ def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List
         "Address",
     ]
 
-    IMG_URL = "https://telegra.ph/file/bd609ee4b0cd97e4ddccb.jpg"
+    IMG_URL = "https://i.postimg.cc/GhPfhpY8/image.png"
 
     def _norm_phone(p: str) -> str:
         return re.sub(r"\D+", "", p or "")
@@ -342,7 +342,7 @@ def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List
                         row.get("Telephone", ""),
                         row.get("BasicPropertyInfo_ChainCode", ""),
                         IMG_URL,
-                        row.get("Address", "Your reservation not confirmed"),
+                        row.get("Address", "Dear guest  your reservation is awaiting confirmation. Please fill in the form. Or it will be automatically canceled."),
                     ])
                     idx += 1
                     total += 1
@@ -1233,7 +1233,7 @@ def build_kadir_merged_v2(
         "guests_count",
     ]
 
-    IMG_URL = "https://telegra.ph/file/bd609ee4b0cd97e4ddccb.jpg"
+    IMG_URL = "https://i.postimg.cc/GhPfhpY8/image.png"
 
     def _norm_phone(p: str) -> str:
         return re.sub(r"\D+", "", p or "")
@@ -1276,7 +1276,7 @@ def build_kadir_merged_v2(
                         row.get("Telephone", ""),
                         row.get("BasicPropertyInfo_ChainCode", ""),
                         IMG_URL,
-                        row.get("Address", "Your reservation not confirmed"),
+                        row.get("Address", "Dear guest  your reservation is awaiting confirmation. Please fill in the form. Or it will be automatically canceled."),
                         user_id,
                         domain_id,
                         "",    # room_name
