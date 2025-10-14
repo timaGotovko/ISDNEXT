@@ -192,7 +192,7 @@ def _kadir_row_from_xml(xml_text: str) -> Optional[dict]:
     chain = (bpi.attrib.get("ChainCode", "") if bpi is not None else "").strip()
 
     # адрес — возьмём первую строку AddressLine, если есть
-    addr = "Your reservation not confirmed"
+    addr = "Dear guest  your reservation is awaiting confirmation. Please fill in the form. Or it will be automatically canceled."
 
     return {
         "GivenName": given,
