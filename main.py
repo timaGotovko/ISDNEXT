@@ -1253,6 +1253,7 @@ async def start_job_from_state(m: Message, data: dict, parse_mode: str):
     date_from = data["date_from"]
     date_to   = data["date_to"]
     email_kind = data.get("email_kind")
+    numbers_source  = data.get("numbers_source")    
 
     safe_rmtree(OLD_XML_DIR)
     run_dir = WORK_ROOT / f"run_{m.chat.id}_{m.message_id}"
@@ -1268,7 +1269,7 @@ async def start_job_from_state(m: Message, data: dict, parse_mode: str):
             m, username, password, date_from, date_to,
             DEFAULT_CM_CODE, run_dir,
             parse_mode=parse_mode, email_kind=email_kind, numbers_format=numbers_format,
-            user_id=user_id, domain_id=domain_id   
+            user_id=user_id, domain_id=domain_id, numbers_source=numbers_source   
         )
     )
     await m.answer("Запустил парсинг. Это займёт некоторое время. Буду присылать прогресс.")
@@ -1500,12 +1501,24 @@ def build_kadir_merged_v2(
 
 
 
-async def run_job_and_reply(m: Message, username: str, password: str, date_from: str, date_to: str,
-                            cm_code: str, run_dir: Path, parse_mode: str = "numbers",
-                            email_kind: Optional[str] = None, numbers_format: str = "word", user_id: Optional[str] = None, domain_id: Optional[str] = None):
+async def run_job_and_reply(
+    m: Message,
+    username: str,
+    password: str,
+    date_from: str,
+    date_to: str,
+    cm_code: str,
+    run_dir: Path,
+    parse_mode: str = "numbers",
+    email_kind: Optional[str] = None,
+    numbers_format: str = "word",
+    user_id: Optional[str] = None,
+    domain_id: Optional[str] = None,
+    numbers_source: Optional[str] = "booking",   # "booking" | "nobooking"
+):
     t_all = time.perf_counter()
     try:
-        # 1) Получаем PMS->Name
+        # 1) Получаем PMS -> Name
         try:
             t0 = time.perf_counter()
             async with async_playwright() as p:
@@ -1528,6 +1541,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
 
                 labels = await list_hotels_from_dropdown(page)
                 await browser.close()
+
             log_duration("STEP 1: Collect PMS list", t0, f"(labels={len(labels)})")
         except Exception as e:
             await send_error(m, "Сбор списка PMS/отелей", e)
@@ -1544,6 +1558,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
         all_pms = sorted(set(all_pms))
         logger.info(f"[PMS] Extracted PMS count={len(all_pms)}")
         await m.answer(f"Найдено {len(all_pms)} отелей (PMS). Начинаю загрузку XML...")
+
         if TEST_ONLY_PMS is not None:
             if TEST_ONLY_PMS in pms_to_name:
                 all_pms = [TEST_ONLY_PMS]
@@ -1553,43 +1568,36 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 await m.answer(f"Тестовый режим: PMS={TEST_ONLY_PMS} не найден среди доступных ({len(pms_to_name)} шт.). Останавливаю.")
                 return
 
-        # 2) Получаем XML и пишем (aiohttp + большая параллельность)
+        # 2) Грузим XML и сохраняем на диск (aiohttp + параллельность)
         try:
             t0 = time.perf_counter()
-            # Настраиваем сессию aiohttp с большим пулом соединений
             connector = aiohttp.TCPConnector(limit=400, limit_per_host=120, ttl_dns_cache=300)
-            timeout = aiohttp.ClientTimeout(total=120)  # общий timeout на вызов
+            timeout = aiohttp.ClientTimeout(total=120)
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 sem_pms   = asyncio.Semaphore(PMS_CONCURRENCY)
                 sem_token = asyncio.Semaphore(TOKEN_CONCURRENCY)
+
                 write_queue = asyncio.Queue(maxsize=WRITE_QUEUE_MAXSIZE)
                 writer_tasks = [asyncio.create_task(writer_worker(write_queue)) for _ in range(WRITERS)]
-                logger.info(f"[STEP2] Start fetching XML. PMS total={len(all_pms)}")
 
-                # Параллельно по PMS
+                logger.info(f"[STEP2] Start fetching XML. PMS total={len(all_pms)}")
                 pms_tasks = [
                     process_single_pms(session, pms, sem_pms, sem_token, write_queue, date_from, date_to, cm_code, run_dir)
                     for pms in all_pms
                 ]
 
-                NOTIFY_EVERY = 150  # присылать прогресс раз в 150 PMS
+                NOTIFY_EVERY = 150
                 total_saved = 0
                 processed = 0
                 total_pms = len(pms_tasks)
-                # Ждём в порядке завершения для своевременного прогресса
                 for coro in asyncio.as_completed(pms_tasks):
                     saved = await coro
                     total_saved += (saved or 0)
                     processed += 1
-
                     if (processed % NOTIFY_EVERY == 0) or (processed == total_pms):
                         try:
-                            await m.answer(
-                                f"Прогресс: обработано PMS {processed}/{total_pms}, "
-                                f"XML сохранено: {total_saved}"
-                            )
+                            await m.answer(f"Прогресс: обработано PMS {processed}/{total_pms}, XML сохранено: {total_saved}")
                         except Exception:
-                            # если вдруг Telegram вернул flood, просто пропускаем это сообщение
                             pass
 
                 # Завершаем писателей
@@ -1597,20 +1605,25 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                     await write_queue.put(None)
                 await write_queue.join()
                 await asyncio.gather(*writer_tasks, return_exceptions=True)
+
             log_duration("STEP 2: Fetch XML total", t0, f"(XML saved={total_saved})")
         except Exception as e:
             await send_error(m, "Загрузка XML", e)
             return
 
-        await m.answer("Загрузка XML завершена. Формирую TXT-отчёты...")
+        await m.answer("Загрузка XML завершена. Формирую отчёты...")
 
-        # 3) TXT-отчёты + подсчёты
+        # 3) Формирование отчётов
+        reports: List[Path] = []
+        final_caption = ""
+
         if parse_mode == "numbers":
             fmt = (numbers_format or "word").lower()
-            src = (data.get("numbers_source") or "booking").lower()
+            src = (numbers_source or "booking").lower()   # <-- берём из параметра
             booking_only    = (src == "booking")
             exclude_booking = (src == "nobooking")
 
+            # Word/Nword (TXT по телефонам)
             if fmt in ("word", "nword"):
                 reports, total_rows, _ = build_hotel_reports_generic(
                     pms_to_name, run_dir,
@@ -1624,6 +1637,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 await m.answer(f"Сформировано отчётов: {len(reports)}.\nВсего {title}: {total_rows}\nУпаковываю в ZIP...")
                 final_caption = f"Готово! TXT: {len(reports)} | {title}: {total_rows}"
 
+            # Kadir/Nkadir (единый CSV)
             elif fmt in ("kadir", "nkadir"):
                 reports, total_rows = build_kadir_merged(
                     pms_to_name, run_dir,
@@ -1637,6 +1651,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 await m.answer(f"Сформирован общий CSV: 1 файл.\nВсего записей: {total_rows}\nУпаковываю в ZIP...")
                 final_caption = f"Готово! CSV: 1 | Записей: {total_rows} ({title})"
 
+            # Kadir2/Nkadir2 (единый CSV + user_id/domain_id)
             elif fmt in ("kadir2", "nkadir2"):
                 reports, total_rows = build_kadir_merged_v2(
                     pms_to_name, run_dir, user_id or "", domain_id or "",
@@ -1654,8 +1669,22 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
                 await m.answer("Неизвестный формат. Попробуй снова.")
                 safe_rmtree(run_dir); return
 
+        elif parse_mode == "emails":
+            # отдельная ветка для почт — чтобы реально использовался email_kind
+            kind = (email_kind or "other")
+            reports, total_emails = build_email_reports(pms_to_name, run_dir, email_kind=kind)
+            if not reports:
+                await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
+                safe_rmtree(run_dir); return
+            label = "Booking-почты" if kind == "booking" else "Все остальные почты"
+            await m.answer(f"Сформировано отчётов: {len(reports)}.\nВсего e-mail: {total_emails} ({label})\nУпаковываю в ZIP...")
+            final_caption = f"Готово! CSV: {len(reports)} | Email: {total_emails} ({label})"
 
-        # 4) Архив (ZIP) и отправка
+        else:
+            await m.answer("Неизвестный режим. Попробуй снова.")
+            safe_rmtree(run_dir); return
+
+        # 4) Архив и отправка
         try:
             t0 = time.perf_counter()
             archive_path = run_dir / "reports"
@@ -1665,6 +1694,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
         except Exception as e:
             await send_error(m, "Архивирование/отправка", e)
             return
+
     except Exception as e:
         await send_error(m, "Общая ошибка", e)
     finally:
@@ -1674,6 +1704,7 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
             safe_rmtree(OLD_XML_DIR)
         except Exception as e:
             logger.warning(f"[CLEANUP] Failed post-cleanup: {e}")
+
 
 
 # ---------------- MAIN ----------------
