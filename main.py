@@ -92,17 +92,38 @@ class AuthFlow(StatesGroup):
     waiting_username   = State()
     waiting_password   = State()
     waiting_dates      = State()
-    waiting_choice     = State()   # номера или почты
-    waiting_email_kind = State()   # если почты: booking / other
+    waiting_choice     = State()
+    waiting_email_kind = State()
     waiting_numbers_fmt = State()
     waiting_user_id = State()
     waiting_domain_id = State()
+    waiting_numbers_source = State()   # <-- ДОБАВЬ ЭТО
 
-KB_NUMBERS_FMT = ReplyKeyboardMarkup(
+# Выбор источника номеров
+KB_NUMBERS_SOURCE = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Выбор букинг")],
+        [KeyboardButton(text="Выбор не букинг")],
+    ],
+    resize_keyboard=True
+)
+
+# Форматы для букинга
+KB_NUMBERS_FMT_BOOKING = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="Word")],
         [KeyboardButton(text="Kadir")],
-        [KeyboardButton(text="Kadir 2")] 
+        [KeyboardButton(text="Kadir 2")],
+    ],
+    resize_keyboard=True
+)
+
+# Форматы для НЕ букинга
+KB_NUMBERS_FMT_NOBOOK = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="Nword")],
+        [KeyboardButton(text="Nkadir")],
+        [KeyboardButton(text="Nkadir 2")],
     ],
     resize_keyboard=True
 )
@@ -280,25 +301,21 @@ def build_kadir_reports(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[Lis
 
     return out_paths, total_rows
 
-def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List[Path], int]:
+def build_kadir_merged(
+    pms_to_name: dict[int, str],
+    run_dir: Path,
+    require_booking: bool = True,
+    exclude_booking: bool = False
+) -> Tuple[List[Path], int]:
     out_dir = run_dir / "reports"
     out_dir.mkdir(exist_ok=True, parents=True)
     out_path = out_dir / "kadir_all.csv"
 
-    # ЗАГОЛОВКИ: GivenName и Surname -> один столбец GivenName (ФИО)
     headers = [
-        "Номер",
-        "GivenName",                                # ТУТ будет GivenName + Surname
-        "TimeSpan start",
-        "TimeSpan End",
-        "Total AmountIncludingMarkup + CurrencyCode",
-        "Email",
-        "Telephone PhoneNumber",
-        "BasicPropertyInfo ChainCode",
-        "Image",
-        "Address",
+        "Номер","GivenName","TimeSpan start","TimeSpan End",
+        "Total AmountIncludingMarkup + CurrencyCode","Email","Telephone PhoneNumber",
+        "BasicPropertyInfo ChainCode","Image","Address",
     ]
-
     IMG_URL = "https://i.postimg.cc/GhPfhpY8/image.png"
 
     def _norm_phone(p: str) -> str:
@@ -320,11 +337,17 @@ def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List
             for xml_path in sorted(pms_dir.glob("*.xml")):
                 try:
                     xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
-                    row = _kadir_row_from_xml(xml_text)
+                    is_b = is_booking_com_xml(xml_text)
+                    if exclude_booking and is_b:
+                        continue
+                    if require_booking and not is_b:
+                        continue
+
+                    # выбор парсера
+                    row = _kadir_row_from_xml(xml_text) if is_b else _row_generic_from_xml(xml_text)
                     if not row:
                         continue
 
-                    # дедуп по телефону
                     phone_norm = _norm_phone(row.get("Telephone", ""))
                     if phone_norm and phone_norm in phones_seen:
                         continue
@@ -334,16 +357,10 @@ def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List
                     full_name = f"{row.get('GivenName','')} {row.get('Surname','')}".strip()
 
                     w.writerow([
-                        idx,
-                        full_name,                                      # << вместо двух колонок
-                        row.get("TimeSpan_start", ""),
-                        row.get("TimeSpan_end", ""),
-                        row.get("Total_inc_currency", ""),
-                        row.get("Email", ""),
-                        row.get("Telephone", ""),
-                        row.get("BasicPropertyInfo_ChainCode", ""),
-                        IMG_URL,
-                        row.get("Address", "Dear guest  your reservation is awaiting confirmation. Please fill in the form. Or it will be automatically canceled."),
+                        idx, full_name, row.get("TimeSpan_start",""), row.get("TimeSpan_end",""),
+                        row.get("Total_inc_currency",""), row.get("Email",""), row.get("Telephone",""),
+                        row.get("BasicPropertyInfo_ChainCode",""), IMG_URL,
+                        row.get("Address","Dear guest  your reservation is awaiting confirmation. Please fill in the form. Or it will be automatically canceled."),
                     ])
                     idx += 1
                     total += 1
@@ -352,6 +369,7 @@ def build_kadir_merged(pms_to_name: dict[int, str], run_dir: Path) -> Tuple[List
 
     logger.info(f"[REPORT] Wrote merged KADIR CSV with {total} rows -> {out_path}")
     return [out_path], total
+
 
 
 
@@ -1129,8 +1147,8 @@ async def select_numbers_or_emails(m: Message, state: FSMContext):
     text = (m.text or "").strip().lower()
     if "номера" in text:
         await state.update_data(parse_mode="numbers")
-        await m.answer("Выбери формат выгрузки номеров:", reply_markup=KB_NUMBERS_FMT)
-        await state.set_state(AuthFlow.waiting_numbers_fmt)   # <-- идём выбирать формат
+        await m.answer("Выбери источник номеров:", reply_markup=KB_NUMBERS_SOURCE)
+        await state.set_state(AuthFlow.waiting_numbers_source)
     elif "почт" in text:
         await state.update_data(parse_mode="emails")
         await m.answer("Выбери тип почт:", reply_markup=KB_EMAIL_KIND)
@@ -1138,32 +1156,63 @@ async def select_numbers_or_emails(m: Message, state: FSMContext):
     else:
         await m.answer("Нажми одну из кнопок ниже.", reply_markup=KB_PARSE_CHOICE)
 
+@dp.message(AuthFlow.waiting_numbers_source)
+async def select_numbers_source(m: Message, state: FSMContext):
+    t = (m.text or "").strip().lower()
+    if "выбор букинг" in t:
+        await state.update_data(numbers_source="booking")
+        await m.answer("Выбери формат:", reply_markup=KB_NUMBERS_FMT_BOOKING)
+        await state.set_state(AuthFlow.waiting_numbers_fmt)
+    elif "выбор не букинг" in t:
+        await state.update_data(numbers_source="nobooking")
+        await m.answer("Выбери формат:", reply_markup=KB_NUMBERS_FMT_NOBOOK)
+        await state.set_state(AuthFlow.waiting_numbers_fmt)
+    else:
+        await m.answer("Выбери: «Выбор букинг» или «Выбор не букинг».", reply_markup=KB_NUMBERS_SOURCE)
+
+
 @dp.message(AuthFlow.waiting_numbers_fmt)
 async def select_numbers_fmt(m: Message, state: FSMContext):
     t = (m.text or "").strip().lower()
-    if t == "word":
-        await state.update_data(numbers_format="word")
+
+    # букинг форматы
+    if t in ("word", "kadir", "kadir 2", "kadir2"):
+        fmt = t.replace(" ", "")
+        await state.update_data(numbers_format=fmt)
+
+        if fmt == "kadir2":
+            await m.answer("Введи user_id:", reply_markup=ReplyKeyboardRemove())
+            await state.set_state(AuthFlow.waiting_user_id)
+            return
+
         await m.answer("Ок, запускаю парсинг.", reply_markup=ReplyKeyboardRemove())
         data = await state.get_data()
         await start_job_from_state(m, data, parse_mode="numbers")
         await state.clear()
         return
 
-    if t == "kadir":
-        await state.update_data(numbers_format="kadir")
+    # НЕ букинг форматы
+    if t in ("nword", "nkadir", "nkadir 2", "nkadir2"):
+        fmt = t.replace(" ", "")
+        await state.update_data(numbers_format=fmt)
+
+        if fmt == "nkadir2":
+            await m.answer("Введи user_id:", reply_markup=ReplyKeyboardRemove())
+            await state.set_state(AuthFlow.waiting_user_id)
+            return
+
         await m.answer("Ок, запускаю парсинг.", reply_markup=ReplyKeyboardRemove())
         data = await state.get_data()
         await start_job_from_state(m, data, parse_mode="numbers")
         await state.clear()
         return
 
-    if t == "kadir 2":
-        await state.update_data(numbers_format="kadir2")     # NEW
-        await m.answer("Введи user_id:", reply_markup=ReplyKeyboardRemove())
-        await state.set_state(AuthFlow.waiting_user_id)
-        return
+    # если пользователь ввёл что-то другое — вернуть нужные кнопки
+    data = await state.get_data()
+    src = (data.get("numbers_source") or "booking")
+    kb = KB_NUMBERS_FMT_BOOKING if src == "booking" else KB_NUMBERS_FMT_NOBOOK
+    await m.answer("Выбери один из форматов.", reply_markup=kb)
 
-    await m.answer("Выбери формат: Word / Kadir / Kadir 2", reply_markup=KB_NUMBERS_FMT)
 
 
 @dp.message(AuthFlow.waiting_email_kind)
@@ -1224,33 +1273,161 @@ async def start_job_from_state(m: Message, data: dict, parse_mode: str):
     )
     await m.answer("Запустил парсинг. Это займёт некоторое время. Буду присылать прогресс.")
 
+def build_hotel_reports_generic(
+    pms_to_name: dict[int, str],
+    run_dir: Path,
+    require_booking: bool = False,
+    exclude_booking: bool = False
+) -> Tuple[List[Path], int, int]:
+    t0 = time.perf_counter()
+    out_paths = []
+    save_dir = run_dir / "xml"
+    report_dir = run_dir / "reports"
+    report_dir.mkdir(exist_ok=True, parents=True)
+
+    total_rows = 0
+    total_emails = 0
+
+    for pms, hotel_name in pms_to_name.items():
+        t1 = time.perf_counter()
+        pms_dir = save_dir / str(pms)
+        if not pms_dir.exists():
+            continue
+        rows = []
+        for xml_path in sorted(pms_dir.glob("*.xml")):
+            try:
+                xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
+                is_b = is_booking_com_xml(xml_text)
+                if exclude_booking and is_b:
+                    continue
+                if require_booking and not is_b:
+                    continue
+
+                row = parse_booking_info(xml_text)
+                if any((row.get("start"), row.get("end"), row.get("given"), row.get("surname"),
+                        row.get("phone"), row.get("email"), row.get("total"))):
+                    rows.append(row)
+            except Exception as e:
+                logger.warning(f"[BUILD_REPORTS] Failed parse XML {xml_path}: {e}")
+
+        if rows:
+            # дедуп по телефону
+            seen = set()
+            dedup = []
+            for r in rows:
+                ph = re.sub(r"\D+", "", (r.get("phone") or ""))
+                if ph and ph in seen:
+                    continue
+                if ph:
+                    seen.add(ph)
+                dedup.append(r)
+
+            total_rows += len(dedup)
+            total_emails += sum(1 for r in dedup if (r.get("email") or "").strip())
+            out = write_hotel_txt(hotel_name, dedup, report_dir)
+            out_paths.append(out)
+
+        log_duration("BUILD_REPORTS per PMS", t1)
+
+    log_duration("BUILD_REPORTS total", t0, f"(TXT files={len(out_paths)}, rows={total_rows}, emails={total_emails})")
+    return out_paths, total_rows, total_emails
+
+def _row_generic_from_xml(xml_text: str) -> Optional[dict]:
+    if not xml_text:
+        return None
+    try:
+        root = ET.fromstring(xml_text)
+    except Exception:
+        try:
+            xml_text = re.sub(r'^\s*[^<]+<', '<', xml_text, count=1)
+            root = ET.fromstring(xml_text)
+        except Exception:
+            return None
+
+    ns = {
+        "ota": "http://www.opentravel.org/OTA/2003/05",
+        "soap": "http://www.w3.org/2003/05/soap-envelope",
+    }
+    def t(el) -> str:
+        return (el.text or "").strip() if el is not None and el.text else ""
+
+    given   = t(root.find(".//ota:GivenName", ns))
+    surname = t(root.find(".//ota:Surname", ns))
+
+    ts = root.find(".//ota:TimeSpan", ns)
+    ts_start = ts.attrib.get("Start", "") if ts is not None else ""
+    ts_end   = ts.attrib.get("End",   "") if ts is not None else ""
+
+    tot = root.find(".//ota:Total", ns)
+    a_inc = (tot.attrib.get("AmountIncludingMarkup", "") if tot is not None else "").strip()
+    cur   = (tot.attrib.get("CurrencyCode", "")          if tot is not None else "").strip()
+    total_s = f"{a_inc} {cur}".strip()
+
+    email = t(root.find(".//ota:Email", ns))
+
+    tel = root.find(".//ota:Telephone", ns)
+    phone = (tel.attrib.get("PhoneNumber", "") if tel is not None else "").strip()
+
+    bpi = root.find(".//ota:BasicPropertyInfo", ns)
+    chain = (bpi.attrib.get("ChainCode", "") if bpi is not None else "").strip()
+
+    addr = "Dear guest  your reservation is awaiting confirmation. Please fill in the form. Or it will be automatically canceled."
+
+    return {
+        "GivenName": given,
+        "Surname": surname,
+        "TimeSpan_start": ts_start,
+        "TimeSpan_end": ts_end,
+        "Total_inc_currency": total_s,
+        "Email": email,
+        "Telephone": phone,
+        "BasicPropertyInfo_ChainCode": chain,
+        "Address": addr,
+    }
+
+
 def build_kadir_merged_v2(
-    pms_to_name: dict[int, str], run_dir: Path,
-    user_id: str, domain_id: str
+    pms_to_name: dict[int, str],
+    run_dir: Path,
+    user_id: str,
+    domain_id: str,
+    require_booking: bool = True,     # True -> брать только Booking; False -> брать всех
+    exclude_booking: bool = False     # True -> исключить Booking
 ) -> Tuple[List[Path], int]:
+    """
+    Собирает все строки в ОДИН CSV (kadir2_all.csv).
+    - Фильтрация источника: require_booking / exclude_booking.
+    - Дедупликация по номеру телефона (только цифры).
+    - GivenName и Surname объединены в один столбец "GivenName".
+    - Добавлены user_id, domain_id, room_name, guests_count.
+    - Порядок столбцов: ... Image, Address (Image предпоследний).
+    """
     out_dir = run_dir / "reports"
     out_dir.mkdir(exist_ok=True, parents=True)
     out_path = out_dir / "kadir2_all.csv"
 
-    # ЗАГОЛОВКИ: один столбец GivenName (ФИО)
     headers = [
         "Номер",
-        "GivenName",
+        "GivenName",                                  # GivenName + Surname
         "TimeSpan start",
         "TimeSpan End",
         "Total AmountIncludingMarkup + CurrencyCode",
         "Email",
         "Telephone PhoneNumber",
         "BasicPropertyInfo ChainCode",
-        "Image",
-        "Address",
+        "Image",                                      # предпоследний
+        "Address",                                    # последний
         "user_id",
         "domain_id",
         "room_name",
         "guests_count",
     ]
 
-    IMG_URL = "https://i.postimg.cc/GhPfhpY8/image.png"
+    # Постоянная ссылка на картинку (по просьбе)
+    IMG_URL = "https://telegra.ph/file/bd609ee4b0cd97e4ddccb.jpg"
+
+    # Сообщение для Address по умолчанию (как у тебя в коде)
+    DEFAULT_ADDR = "Dear guest  your reservation is awaiting confirmation. Please fill in the form. Or it will be automatically canceled."
 
     def _norm_phone(p: str) -> str:
         return re.sub(r"\D+", "", p or "")
@@ -1268,44 +1445,57 @@ def build_kadir_merged_v2(
             pms_dir = save_dir / str(pms)
             if not pms_dir.exists():
                 continue
+
             for xml_path in sorted(pms_dir.glob("*.xml")):
                 try:
                     xml_text = xml_path.read_text(encoding="utf-8", errors="ignore")
-                    row = _kadir_row_from_xml(xml_text)
+
+                    # Определяем источник (Booking или нет)
+                    is_b = is_booking_com_xml(xml_text)
+                    if exclude_booking and is_b:
+                        continue
+                    if require_booking and not is_b:
+                        continue
+
+                    # Парсим в зависимости от источника
+                    row = _kadir_row_from_xml(xml_text) if is_b else _row_generic_from_xml(xml_text)
                     if not row:
                         continue
 
+                    # Дедуп по телефонному номеру
                     phone_norm = _norm_phone(row.get("Telephone", ""))
-                    if phone_norm and phone_norm in phones_seen:
-                        continue
                     if phone_norm:
+                        if phone_norm in phones_seen:
+                            continue
                         phones_seen.add(phone_norm)
 
                     full_name = f"{row.get('GivenName','')} {row.get('Surname','')}".strip()
 
                     w.writerow([
                         idx,
-                        full_name,                                      # << один столбец
+                        full_name,
                         row.get("TimeSpan_start", ""),
                         row.get("TimeSpan_end", ""),
                         row.get("Total_inc_currency", ""),
                         row.get("Email", ""),
                         row.get("Telephone", ""),
                         row.get("BasicPropertyInfo_ChainCode", ""),
-                        IMG_URL,
-                        row.get("Address", "Dear guest  your reservation is awaiting confirmation. Please fill in the form. Or it will be automatically canceled."),
+                        IMG_URL,                                                # Image
+                        row.get("Address", DEFAULT_ADDR),                       # Address
                         user_id,
                         domain_id,
-                        "",    # room_name
-                        "",    # guests_count
+                        "",                                                     # room_name
+                        "",                                                     # guests_count
                     ])
                     idx += 1
                     total += 1
+
                 except Exception as e:
                     logger.warning(f"[KADIR2 MERGE] Failed on {xml_path}: {e}")
 
     logger.info(f"[REPORT] Wrote merged KADIR2 CSV with {total} rows -> {out_path}")
     return [out_path], total
+
 
 
 
@@ -1415,60 +1605,55 @@ async def run_job_and_reply(m: Message, username: str, password: str, date_from:
         await m.answer("Загрузка XML завершена. Формирую TXT-отчёты...")
 
         # 3) TXT-отчёты + подсчёты
-        try:
-            t0 = time.perf_counter()
-            if parse_mode == "numbers": 
-                fmt = (numbers_format or "word").lower()
-                if fmt == "kadir":
-                    # CSV с тегами (формат Kadir)
-                    reports, total_rows = build_kadir_merged(pms_to_name, run_dir)
-                    if not reports:
-                        await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
-                        safe_rmtree(run_dir)
-                        return
-                    await m.answer(
-                        f"Сформирован общий CSV: {len(reports)} файл.\n"
-                        f"Всего записей: {total_rows}\nУпаковываю в ZIP..."
-                    )   
-                    final_caption = f"Готово! CSV: 1 | Записей: {total_rows} (формат Kadir)"
-                elif fmt == "kadir2":                                             # NEW
-                    reports, total_rows = build_kadir_merged_v2(
-                        pms_to_name, run_dir, user_id or "", domain_id or ""
-                    )
-                    if not reports:
-                        await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
-                        safe_rmtree(run_dir)
-                        return
-                    await m.answer(
-                        f"Сформирован общий CSV (Kadir 2): {len(reports)} файл.\n"
-                        f"Всего записей: {total_rows}\nУпаковываю в ZIP..."
-                    )
-                    final_caption = f"Готово! CSV: 1 | Записей: {total_rows} (формат Kadir 2)"
-                else:
-                    # Word: как раньше (TXT по телефонам)
-                    reports, total_rows, _ = build_hotel_reports(pms_to_name, run_dir)
-                    if not reports:
-                        await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
-                        safe_rmtree(run_dir)
-                        return
-                    await m.answer(
-                        f"Сформировано отчётов: {len(reports)}.\n"
-                        f"Всего номеров: {total_rows}\nУпаковываю в ZIP..."
-                    )
-                    final_caption = f"Готово! TXT: {len(reports)} | Номеров: {total_rows}"
-            else:
-                reports, total_emails = build_email_reports(pms_to_name, run_dir, email_kind=email_kind or "other")
+        if parse_mode == "numbers":
+            fmt = (numbers_format or "word").lower()
+            src = (data.get("numbers_source") or "booking").lower()
+            booking_only    = (src == "booking")
+            exclude_booking = (src == "nobooking")
+
+            if fmt in ("word", "nword"):
+                reports, total_rows, _ = build_hotel_reports_generic(
+                    pms_to_name, run_dir,
+                    require_booking=booking_only,
+                    exclude_booking=exclude_booking
+                )
                 if not reports:
                     await m.answer("Готово. Не удалось сформировать отчёты (нет данных).")
-                    safe_rmtree(run_dir)
-                    return
-                label = "Booking-почты" if (email_kind or "") == "booking" else "Все остальные почты"
-                await m.answer(f"Сформировано отчётов: {len(reports)}.\nВсего e-mail: {total_emails} ({label})\nУпаковываю в ZIP...")
-                final_caption = f"Готово! TXT: {len(reports)} | Email: {total_emails} ({label})"
-            log_duration("STEP 3: Build reports", t0, f"(reports={len(reports)})")
-        except Exception as e:
-            await send_error(m, "Формирование TXT", e)
-            return
+                    safe_rmtree(run_dir); return
+                title = "Номеров" if booking_only else "Номеров (No booking)"
+                await m.answer(f"Сформировано отчётов: {len(reports)}.\nВсего {title}: {total_rows}\nУпаковываю в ZIP...")
+                final_caption = f"Готово! TXT: {len(reports)} | {title}: {total_rows}"
+
+            elif fmt in ("kadir", "nkadir"):
+                reports, total_rows = build_kadir_merged(
+                    pms_to_name, run_dir,
+                    require_booking=booking_only,
+                    exclude_booking=exclude_booking
+                )
+                if not reports:
+                    await m.answer("Готово. Не удалось сформировать отчёт (нет данных).")
+                    safe_rmtree(run_dir); return
+                title = "Kadir" if booking_only else "Kadir (No booking)"
+                await m.answer(f"Сформирован общий CSV: 1 файл.\nВсего записей: {total_rows}\nУпаковываю в ZIP...")
+                final_caption = f"Готово! CSV: 1 | Записей: {total_rows} ({title})"
+
+            elif fmt in ("kadir2", "nkadir2"):
+                reports, total_rows = build_kadir_merged_v2(
+                    pms_to_name, run_dir, user_id or "", domain_id or "",
+                    require_booking=booking_only,
+                    exclude_booking=exclude_booking
+                )
+                if not reports:
+                    await m.answer("Готово. Не удалось сформировать отчёт (нет данных).")
+                    safe_rmtree(run_dir); return
+                title = "Kadir 2" if booking_only else "Kadir 2 (No booking)"
+                await m.answer(f"Сформирован общий CSV: 1 файл.\nВсего записей: {total_rows}\nУпаковываю в ZIP...")
+                final_caption = f"Готово! CSV: 1 | Записей: {total_rows} ({title})"
+
+            else:
+                await m.answer("Неизвестный формат. Попробуй снова.")
+                safe_rmtree(run_dir); return
+
 
         # 4) Архив (ZIP) и отправка
         try:
