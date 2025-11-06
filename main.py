@@ -59,7 +59,7 @@ WORK_ROOT.mkdir(exist_ok=True)
 OLD_XML_DIR = Path("xml_api")  # из старых запусков — будем чистить
 
 SAFE_CHARS = re.compile(r'[\\/*?:"<>|]+')
-TEST_ONLY_PMS = 7  # например, 7
+TEST_ONLY_PMS = None  # например, 7
 
 # ======= доп. фильтр доменов для "все остальные почты" =======
 EXCLUDE_EMAIL_DOMAINS = {
@@ -1478,7 +1478,7 @@ def build_kadir_merged_v2(
                     if phone_norm in phones_seen:
                         continue
                     phones_seen.add(phone_norm)
-                    
+
                     full_name = f"{row.get('GivenName','')} {row.get('Surname','')}".strip()
 
                     w.writerow([
