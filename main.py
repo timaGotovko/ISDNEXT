@@ -349,10 +349,15 @@ def build_kadir_merged(
                         continue
 
                     phone_norm = _norm_phone(row.get("Telephone", ""))
-                    if phone_norm and phone_norm in phones_seen:
+
+                    # ПОЛНОСТЬЮ пропустить пустые номера
+                    if not phone_norm:
                         continue
-                    if phone_norm:
-                        phones_seen.add(phone_norm)
+
+                    # Дедуп по номеру
+                    if phone_norm in phones_seen:
+                        continue
+                    phones_seen.add(phone_norm)
 
                     full_name = f"{row.get('GivenName','')} {row.get('Surname','')}".strip()
 
@@ -1465,11 +1470,15 @@ def build_kadir_merged_v2(
 
                     # Дедуп по телефонному номеру
                     phone_norm = _norm_phone(row.get("Telephone", ""))
-                    if phone_norm:
-                        if phone_norm in phones_seen:
-                            continue
-                        phones_seen.add(phone_norm)
 
+# ПОЛНОСТЬЮ пропускаем строки без номера
+                    if not phone_norm:
+                        continue
+
+                    if phone_norm in phones_seen:
+                        continue
+                    phones_seen.add(phone_norm)
+                    
                     full_name = f"{row.get('GivenName','')} {row.get('Surname','')}".strip()
 
                     w.writerow([
